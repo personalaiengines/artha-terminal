@@ -1,0 +1,112 @@
+{
+  "ok": true,
+  "spot": 76391.39,
+  "expiry": "2026-07-30",
+  "atm": 76400.0,
+  "pcr_oi": 0.76,
+  "max_pain": 76500.0,
+  "oi_walls": {
+    "call_wall": 77500.0,
+    "put_wall": 75000.0
+  },
+  "expected_move": {
+    "straddle": 1138.05,
+    "upper": 77529.44,
+    "lower": 75253.34,
+    "pct": 1.489762131570063
+  },
+  "atm_iv": 13.35,
+  "india_vix": 13.48,
+  "bias": {
+    "score": 47,
+    "label": "NEUTRAL",
+    "drivers": [
+      {
+        "name": "PCR",
+        "detail": "0.76 (balanced)",
+        "delta": 0
+      },
+      {
+        "name": "OI change",
+        "detail": "put\u2212call \u0394OI -955,180",
+        "delta": -2.8
+      }
+    ]
+  },
+  "strategy": {
+    "name": "Calendar / wait",
+    "note": "Range-bound but IV is low \u2014 little premium to sell; often a no-trade day.",
+    "iv_regime": "low",
+    "anchors": {
+      "call_wall": 77500.0,
+      "put_wall": 75000.0,
+      "em_upper": 77529.4,
+      "em_lower": 75253.3
+    }
+  },
+  "levels": [
+    {
+      "label": "Max Pain",
+      "price": 76500.0,
+      "kind": "maxpain"
+    },
+    {
+      "label": "Call OI Wall (R)",
+      "price": 77500.0,
+      "kind": "resistance"
+    },
+    {
+      "label": "Put OI Wall (S)",
+      "price": 75000.0,
+      "kind": "support"
+    },
+    {
+      "label": "Exp-Move Upper",
+      "price": 77529.4,
+      "kind": "range"
+    },
+    {
+      "label": "Exp-Move Lower",
+      "price": 75253.3,
+      "kind": "range"
+    },
+    {
+      "label": "Pivot R2",
+      "price": 76998.0,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot R1",
+      "price": 76694.7,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot P",
+      "price": 76423.3,
+      "kind": "pivot"
+    },
+    {
+      "label": "Pivot S1",
+      "price": 76120.0,
+      "kind": "support"
+    },
+    {
+      "label": "Pivot S2",
+      "price": 75848.7,
+      "kind": "support"
+    },
+    {
+      "label": "Prev Day High",
+      "price": 76726.7,
+      "kind": "resistance"
+    },
+    {
+      "label": "Prev Day Low",
+      "price": 76152.0,
+      "kind": "support"
+    }
+  ],
+  "index": "sensex",
+  "name": "SENSEX",
+  "generated_ist": "2026-07-24T08:11:49.052289+05:30"
+}

@@ -1,0 +1,363 @@
+"""
+ARTHA Terminal - Tool Registry
+Defines all tools available to the LLM agent.
+"""
+
+from dataclasses import dataclass
+from typing import Callable, Any
+import asyncio
+import json
+import time
+
+
+@dataclass
+class Tool:
+    """Tool definition for LLM function calling."""
+    name: str
+    description: str
+    parameters: dict
+    handler: Callable
+
+
+# Tool JSON Schema for OpenRouter/Nvidia API
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_price_history",
+            "description": "Get historical OHLCV price data with computed technical indicators",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol (e.g., RELIANCE, TCS)"
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "Start date (YYYY-MM-DD)"
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "End date (YYYY-MM-DD)"
+                    },
+                    "interval": {
+                        "type": "string",
+                        "enum": ["1d", "1wk", "1mo"],
+                        "description": "Candle interval"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fundamentals",
+            "description": "Get financial ratios, valuation metrics, and key fundamentals",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_shareholding",
+            "description": "Get quarterly ownership patterns (promoter, FII, DII, public)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol"
+                    },
+                    "quarters": {
+                        "type": "integer",
+                        "description": "Number of recent quarters (default: 8)"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_peers",
+            "description": "Get top-N same-industry peers by market cap for comparison",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol"
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of peers (default: 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_red_flags",
+            "description": "Run deterministic red-flag engine to identify financial risks",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_scorecard",
+            "description": "Generate weighted 0-10 analysis scorecard (valuation, growth, health, momentum, sector)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sector_news",
+            "description": "Fetch recent news headlines for a sector via search API",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sector": {
+                        "type": "string",
+                        "description": "Sector name (e.g., Banking, IT, Pharma)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of headlines (default: 10)",
+                        "default": 10
+                    }
+                },
+                "required": ["sector"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_market",
+            "description": "Search for stocks by name, sector, or criteria",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (company name, sector, industry)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 10
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+
+class ToolRegistry:
+    """Registry and dispatcher for agent tools."""
+
+    def __init__(self):
+        self._tools: dict[str, Callable] = {}
+        self._registered = False
+
+    def register(self, func: Callable) -> Callable:
+        """Decorator to register a tool."""
+        self._tools[func.__name__] = func
+        self._registered = True
+        return func
+
+    def get_tool(self, name: str) -> Callable | None:
+        """Get tool handler by name."""
+        return self._tools.get(name)
+
+    def list_tools(self) -> list[Tool]:
+        """List all registered tools with schemas."""
+        return TOOL_SCHEMAS
+
+
+# Global registry
+registry = ToolRegistry()
+
+
+# ============================================
+# Tool Handlers — backed by the real services/engines, not stubs.
+#
+# All of these were previously NOT_IMPLEMENTED placeholders even though the
+# real data sources already existed in services/engines; the LLM would call
+# them mid-analysis and silently get an empty payload back. get_shareholding
+# stays NOT_IMPLEMENTED for real: there's no quarterly promoter/FII/DII
+# scraper wired up anywhere in the project, so that one's an honest gap.
+# ============================================
+
+# Per-symbol live snapshot (yfinance) is the shared input for price history,
+# fundamentals, peers, red flags, and the scorecard — one tool call fetching
+# it, cached briefly so a single chat turn that calls several of these tools
+# for the same symbol doesn't hit yfinance five times over.
+_SNAP_TTL = 300  # seconds
+_snap_cache: dict[str, tuple[float, dict | None]] = {}
+
+
+def _get_snapshot(symbol: str) -> dict | None:
+    from services.stock_data import get_live_stock_data
+    key = symbol.strip().upper()
+    hit = _snap_cache.get(key)
+    if hit and time.time() - hit[0] < _SNAP_TTL:
+        return hit[1]
+    snap = get_live_stock_data(key)
+    _snap_cache[key] = (time.time(), snap)
+    return snap
+
+
+@registry.register
+async def get_price_history(
+    symbol: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    interval: str = "1d"
+) -> dict:
+    """Get historical OHLCV price data with computed technical indicators."""
+    snap = await asyncio.to_thread(_get_snapshot, symbol)
+    if not snap:
+        return {"symbol": symbol, "data": [], "status": "NOT_FOUND",
+                "message": f"No price history available for {symbol}."}
+
+    df = snap["history"]
+    if start_date:
+        df = df[df["date"] >= start_date]
+    if end_date:
+        df = df[df["date"] <= end_date]
+    # Cap the payload back to the LLM — it doesn't need 5 years of daily candles.
+    rows = df.tail(180).to_dict("records")
+    return {"symbol": symbol, "data": rows, "metrics": snap["metrics"], "status": "OK"}
+
+
+@registry.register
+async def get_fundamentals(symbol: str) -> dict:
+    """Get financial ratios, valuation metrics, and key fundamentals."""
+    snap = await asyncio.to_thread(_get_snapshot, symbol)
+    if not snap:
+        return {"symbol": symbol, "status": "NOT_FOUND"}
+    return {"symbol": symbol, **snap["fundamentals"], "status": "OK"}
+
+
+@registry.register
+async def get_shareholding(symbol: str, quarters: int = 8) -> dict:
+    """Get quarterly ownership patterns (promoter, FII, DII, public)."""
+    # No quarterly promoter/FII/DII scraper is wired up anywhere in this
+    # project (yfinance only exposes a point-in-time institutional-holders
+    # snapshot) — this is a genuine data gap, not a stub left unimplemented.
+    return {
+        "symbol": symbol,
+        "data": [],
+        "status": "NOT_IMPLEMENTED",
+        "message": "No quarterly shareholding-pattern source is configured for this deployment.",
+    }
+
+
+@registry.register
+async def resolve_peers(symbol: str, n: int = 5) -> dict:
+    """Get top-N same-industry peers by market cap for comparison."""
+    snap = await asyncio.to_thread(_get_snapshot, symbol)
+    if not snap:
+        return {"symbol": symbol, "peers": [], "status": "NOT_FOUND"}
+    from services.stock_data import get_sector_peers
+    sector = snap["metrics"].get("sector")
+    peers_df = await asyncio.to_thread(get_sector_peers, symbol, sector, "return_6m")
+    peers = peers_df.to_dict("records") if peers_df is not None and not peers_df.empty else []
+    return {"symbol": symbol, "peers": peers[:n], "status": "OK"}
+
+
+@registry.register
+async def scan_red_flags(symbol: str) -> dict:
+    """Run deterministic red-flag engine to identify financial risks."""
+    snap = await asyncio.to_thread(_get_snapshot, symbol)
+    if not snap:
+        return {"symbol": symbol, "flags": [], "status": "NOT_FOUND"}
+    from engines.red_flags import RedFlagEngine
+    findings = RedFlagEngine().scan(
+        fundamentals=snap.get("red_flag_inputs", {}),
+        shareholding=snap.get("shareholding", []),
+        symbol=symbol,
+    )
+    flags = [{"rule_id": f.rule_id, "name": f.name, "severity": f.severity.value,
+              "message": f.message, "actual_value": f.actual_value} for f in findings]
+    return {"symbol": symbol, "flags": flags, "status": "OK"}
+
+
+@registry.register
+async def compute_scorecard(symbol: str) -> dict:
+    """Generate weighted 0-10 analysis scorecard (valuation, growth, health, momentum, sector)."""
+    snap = await asyncio.to_thread(_get_snapshot, symbol)
+    if not snap:
+        return {"symbol": symbol, "total_score": None, "sub_scores": {}, "status": "NOT_FOUND"}
+    from engines.scorecard import ScorecardEngine
+    from services.stock_data import get_sector_peers
+    sector = snap["metrics"].get("sector")
+    peers_df = await asyncio.to_thread(get_sector_peers, symbol, sector, "return_6m")
+    peers = peers_df.to_dict("records") if peers_df is not None and not peers_df.empty else []
+    scorecard = ScorecardEngine().compute(
+        symbol=symbol, data=snap["metrics"], fundamentals=snap["fundamentals"],
+        shareholding=snap.get("shareholding", []), peers=peers,
+    )
+    return {**scorecard.to_dict(), "status": "OK"}
+
+
+@registry.register
+async def sector_news(sector: str, limit: int = 10) -> dict:
+    """Fetch recent news headlines for a sector via search API."""
+    from services.search import sector_news as _sector_news
+    result = await _sector_news(sector, limit)
+    return {**result, "status": "OK"}
+
+
+@registry.register
+async def search_market(query: str, limit: int = 10) -> dict:
+    """Search for stocks by name, sector, or criteria."""
+    from services.instruments import search as _search_instruments
+    results = await asyncio.to_thread(_search_instruments, query, limit)
+    return {"query": query, "results": results, "status": "OK"}
+
+
+def get_tools_for_llm() -> list[dict]:
+    """Get tools in format expected by LLM API."""
+    return TOOL_SCHEMAS

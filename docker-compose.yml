@@ -1,0 +1,95 @@
+# ============================================
+# ARTHA Terminal - Docker Compose
+# ============================================
+# Start: docker compose up -d   ·   Stop: docker compose down   ·   Logs: docker compose logs -f
+#   web  → http://localhost:3000 (Next.js UI)
+#   api  → http://localhost:8000 (Starlette JSON API over services/engines/DB)
+
+services:
+  # --------------------------------------------
+  # ARTHA API — Starlette JSON API (services/engines/DB)
+  # --------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: artha-api
+    container_name: artha-api
+    # Override kept so the pre-slim image (Streamlit entrypoint) still runs the
+    # API until a clean slim rebuild happens; harmless for the slim image too.
+    entrypoint: []
+    command: ["uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    environment:
+      - ARTHA_DB_PATH=/data/db/artha.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - artha-db:/data/db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - artha-net
+
+  # --------------------------------------------
+  # ARTHA Web UI — Next.js
+  # --------------------------------------------
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: artha-web
+    container_name: artha-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - ARTHA_API_URL=http://api:8000
+    depends_on:
+      - api
+    healthcheck:
+      # 127.0.0.1, not localhost: the Alpine (musl) runtime image doesn't resolve
+      # 'localhost', so wget to it fails even though the server listens on
+      # 0.0.0.0:3000 and is perfectly healthy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - artha-net
+
+  # --------------------------------------------
+  # Optional: SearxNG (unlimited search fallback)
+  # Start with: docker compose --profile search up -d
+  # --------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    profiles: [search]
+    ports:
+      - "8080:8080"
+    volumes:
+      - searxng-config:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    restart: unless-stopped
+    networks:
+      - artha-net
+
+volumes:
+  artha-db:        # SQLite DB (kept name so existing data persists)
+    driver: local
+  searxng-config:
+    driver: local
+
+networks:
+  artha-net:
+    driver: bridge

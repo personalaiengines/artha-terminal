@@ -1,0 +1,58 @@
+# ARTHA Terminal — theme.
+# Native Streamlit theming does the heavy lifting (colors, fonts, radius,
+# widget chrome, chart palettes). ui/theme.py only adds the few custom
+# components Streamlit has no native equivalent for (panel, metric card).
+
+[theme]
+base = "dark"
+primaryColor = "#60A5FA"              # laser  — accent, buttons, links
+backgroundColor = "#0F172A"           # abyss  — app background
+secondaryBackgroundColor = "#1E293B"  # depth  — panels, widgets
+codeBackgroundColor = "#1E293B"
+textColor = "#F1F5F9"                 # frost
+linkColor = "#60A5FA"
+borderColor = "#334155"               # grid
+codeTextColor = "#CBD5E1"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "10px"
+buttonRadius = "10px"
+
+font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap"
+baseFontSize = 14
+baseFontWeight = 400
+codeFontSize = "13px"
+headingFontSizes = ["30px", "22px", "18px", "16px", "14px", "12px"]
+headingFontWeights = [700, 600, 600, 600, 500, 500]
+linkUnderline = false
+
+# Semantic colors — up/down/warn read the same everywhere
+greenColor = "#34D399"
+redColor = "#F87171"
+yellowColor = "#FBBF24"
+orangeColor = "#FB923C"
+blueColor = "#60A5FA"
+violetColor = "#A78BFA"
+grayColor = "#94A3B8"
+
+chartCategoricalColors = [
+    "#60A5FA", "#34D399", "#A78BFA", "#F87171",
+    "#FBBF24", "#38BDF8", "#94A3B8", "#FB923C",
+]
+chartSequentialColors = [
+    "#0C4A6E", "#075985", "#0369A1", "#0284C7", "#0EA5E9",
+    "#38BDF8", "#7DD3FC", "#BAE6FD", "#E0F2FE", "#F0F9FF",
+]
+
+dataframeBorderColor = "#334155"
+dataframeHeaderBackgroundColor = "#1E293B"
+
+[theme.sidebar]
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+codeBackgroundColor = "#1E293B"
+textColor = "#F1F5F9"
+borderColor = "#334155"
+primaryColor = "#60A5FA"

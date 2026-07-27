@@ -1,0 +1,83 @@
+{
+  "index": "sensex",
+  "symbol": "BSE:SENSEX",
+  "date": "2026-07-24",
+  "levels": [
+    {
+      "label": "Max Pain",
+      "price": 76500.0,
+      "kind": "maxpain"
+    },
+    {
+      "label": "Call OI Wall (R)",
+      "price": 77500.0,
+      "kind": "resistance"
+    },
+    {
+      "label": "Put OI Wall (S)",
+      "price": 75000.0,
+      "kind": "support"
+    },
+    {
+      "label": "Exp-Move Upper",
+      "price": 77529.4,
+      "kind": "range"
+    },
+    {
+      "label": "Exp-Move Lower",
+      "price": 75253.3,
+      "kind": "range"
+    },
+    {
+      "label": "Pivot R2",
+      "price": 76998.0,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot R1",
+      "price": 76694.7,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot P",
+      "price": 76423.3,
+      "kind": "pivot"
+    },
+    {
+      "label": "Pivot S1",
+      "price": 76120.0,
+      "kind": "support"
+    },
+    {
+      "label": "Pivot S2",
+      "price": 75848.7,
+      "kind": "support"
+    },
+    {
+      "label": "Prev Day High",
+      "price": 76726.7,
+      "kind": "resistance"
+    },
+    {
+      "label": "Prev Day Low",
+      "price": 76152.0,
+      "kind": "support"
+    }
+  ],
+  "commands": [
+    "symbol BSE:SENSEX",
+    "draw shape --type horizontal_line --price 76500 --time 1784860909 --text 'ARTHA \u00b7 Max Pain' --overrides '{\"linecolor\": \"#FF2E86\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF2E86\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 77500 --time 1784860909 --text 'ARTHA \u00b7 Call OI Wall (R)' --overrides '{\"linecolor\": \"#FF3B4E\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF3B4E\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 75000 --time 1784860909 --text 'ARTHA \u00b7 Put OI Wall (S)' --overrides '{\"linecolor\": \"#21F3A0\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#21F3A0\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 77529.4 --time 1784860909 --text 'ARTHA \u00b7 Exp-Move Upper' --overrides '{\"linecolor\": \"#FFD84D\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FFD84D\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 75253.3 --time 1784860909 --text 'ARTHA \u00b7 Exp-Move Lower' --overrides '{\"linecolor\": \"#FFD84D\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FFD84D\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 76998 --time 1784860909 --text 'ARTHA \u00b7 Pivot R2' --overrides '{\"linecolor\": \"#FF3B4E\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF3B4E\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 76694.7 --time 1784860909 --text 'ARTHA \u00b7 Pivot R1' --overrides '{\"linecolor\": \"#FF3B4E\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF3B4E\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 76423.3 --time 1784860909 --text 'ARTHA \u00b7 Pivot P' --overrides '{\"linecolor\": \"#7C8BB8\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#7C8BB8\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 76120 --time 1784860909 --text 'ARTHA \u00b7 Pivot S1' --overrides '{\"linecolor\": \"#21F3A0\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#21F3A0\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 75848.7 --time 1784860909 --text 'ARTHA \u00b7 Pivot S2' --overrides '{\"linecolor\": \"#21F3A0\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#21F3A0\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 76726.7 --time 1784860909 --text 'ARTHA \u00b7 Prev Day High' --overrides '{\"linecolor\": \"#FF3B4E\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF3B4E\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 76152 --time 1784860909 --text 'ARTHA \u00b7 Prev Day Low' --overrides '{\"linecolor\": \"#21F3A0\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#21F3A0\", \"showPrice\": true}'"
+  ],
+  "generated_ist": "2026-07-24T08:11:49.054381+05:30"
+}

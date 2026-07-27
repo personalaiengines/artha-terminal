@@ -1,0 +1,117 @@
+{
+  "ok": true,
+  "spot": 23869.6,
+  "expiry": "2026-07-28",
+  "atm": 23850.0,
+  "pcr_oi": 0.68,
+  "max_pain": 24000.0,
+  "oi_walls": {
+    "call_wall": 25000.0,
+    "put_wall": 23000.0
+  },
+  "expected_move": {
+    "straddle": 258.15,
+    "upper": 24127.75,
+    "lower": 23611.449999999997,
+    "pct": 1.0815011562824681
+  },
+  "atm_iv": 11.54,
+  "india_vix": 13.48,
+  "bias": {
+    "score": 32,
+    "label": "BEARISH",
+    "drivers": [
+      {
+        "name": "PCR",
+        "detail": "0.68 (call-writing/heavy)",
+        "delta": -8.779527718216912
+      },
+      {
+        "name": "OI change",
+        "detail": "put\u2212call \u0394OI -16,575,715",
+        "delta": -10.0
+      },
+      {
+        "name": "Max-pain pull",
+        "detail": "spot -0.5% vs max pain",
+        "delta": 1.1
+      }
+    ]
+  },
+  "strategy": {
+    "name": "Bear Put (debit) Spread",
+    "note": "Buy a put debit spread; cheap IV favours long premium.",
+    "iv_regime": "low",
+    "anchors": {
+      "call_wall": 25000.0,
+      "put_wall": 23000.0,
+      "em_upper": 24127.8,
+      "em_lower": 23611.4
+    }
+  },
+  "levels": [
+    {
+      "label": "Max Pain",
+      "price": 24000.0,
+      "kind": "maxpain"
+    },
+    {
+      "label": "Call OI Wall (R)",
+      "price": 25000.0,
+      "kind": "resistance"
+    },
+    {
+      "label": "Put OI Wall (S)",
+      "price": 23000.0,
+      "kind": "support"
+    },
+    {
+      "label": "Exp-Move Upper",
+      "price": 24127.8,
+      "kind": "range"
+    },
+    {
+      "label": "Exp-Move Lower",
+      "price": 23611.4,
+      "kind": "range"
+    },
+    {
+      "label": "Pivot R2",
+      "price": 24072.7,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot R1",
+      "price": 23971.2,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot P",
+      "price": 23889.2,
+      "kind": "pivot"
+    },
+    {
+      "label": "Pivot S1",
+      "price": 23787.6,
+      "kind": "support"
+    },
+    {
+      "label": "Pivot S2",
+      "price": 23705.6,
+      "kind": "support"
+    },
+    {
+      "label": "Prev Day High",
+      "price": 23990.8,
+      "kind": "resistance"
+    },
+    {
+      "label": "Prev Day Low",
+      "price": 23807.2,
+      "kind": "support"
+    }
+  ],
+  "index": "nifty50",
+  "name": "NIFTY 50",
+  "generated_ist": "2026-07-24T08:10:57.774703+05:30"
+}

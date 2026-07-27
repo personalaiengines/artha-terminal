@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+/* ============================================================
+   ARTHA TERMINAL — DESIGN SYSTEM (single source of truth)
+   Every color, radius, shadow, motion below is consumed by
+   the whole app. Change here → changes everywhere.
+   ============================================================ */
+
+@theme {
+  /* ---- Surfaces (layered depth, almost-black → elevated) ---- */
+  --color-abyss: #08090c;        /* app background, deepest */
+  --color-void: #0b0d11;         /* rails, deep panels */
+  --color-surface: #101319;      /* primary panels */
+  --color-elevated: #161a22;     /* cards */
+  --color-raised: #1c2029;       /* hover / popovers */
+  --color-line: #23272f;         /* solid hairline */
+
+  /* ---- Text ---- */
+  --color-frost: #eef1f6;        /* primary text */
+  --color-mist: #b6bdcc;         /* secondary text */
+  --color-muted: #7b8394;        /* tertiary / labels */
+  --color-faint: #545c6b;        /* disabled / axis */
+
+  /* ---- Intent (used ONLY for their meaning) ---- */
+  --color-accent: #3b82f6;       /* interaction / links / focus */
+  --color-accent-soft: #1d3a63;
+  --color-ai: #8b5cf6;           /* AI only */
+  --color-ai-soft: #2f2652;
+  --color-up: #10b981;           /* positive performance only */
+  --color-up-soft: #0e3b30;
+  --color-down: #f4586a;         /* negative performance only */
+  --color-down-soft: #43222a;
+  --color-warn: #f5a623;         /* caution */
+  --color-warn-soft: #40320f;
+
+  /* ---- Radius ---- */
+  --radius-xs: 6px;
+  --radius-sm: 9px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-2xl: 28px;
+
+  /* ---- Typography ---- */
+  --font-sans: "Inter", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* ---- Elevation (soft, layered, never harsh) ---- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 24px -8px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 24px 60px -20px rgba(0, 0, 0, 0.7);
+  --shadow-glow-ai: 0 0 0 1px rgba(139, 92, 246, 0.25), 0 12px 40px -12px rgba(139, 92, 246, 0.35);
+
+  /* ---- Motion ---- */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* ---- Base reset / defaults ---- */
+* {
+  border-color: color-mix(in oklab, var(--color-line) 100%, transparent);
+}
+
+html {
+  color-scheme: dark;
+  scroll-behavior: smooth;
+}
+
+body {
+  background:
+    radial-gradient(1200px 800px at 15% -10%, color-mix(in oklab, var(--color-accent) 7%, transparent), transparent 60%),
+    radial-gradient(1000px 700px at 100% 0%, color-mix(in oklab, var(--color-ai) 6%, transparent), transparent 55%),
+    var(--color-abyss);
+  color: var(--color-frost);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.011em;
+}
+
+/* Tabular numbers everywhere financial data lives */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* ---- Custom utilities layered on Tailwind ---- */
+@layer utilities {
+  .glass {
+    background: color-mix(in oklab, var(--color-elevated) 72%, transparent);
+    backdrop-filter: blur(18px) saturate(140%);
+  }
+  .hairline {
+    border: 1px solid color-mix(in oklab, #ffffff 6%, transparent);
+  }
+  .hairline-strong {
+    border: 1px solid color-mix(in oklab, #ffffff 9%, transparent);
+  }
+  .ring-focus {
+    outline: 2px solid transparent;
+  }
+  .ring-focus:focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--color-accent) 80%, transparent);
+    outline-offset: 2px;
+  }
+  .grid-lines {
+    background-image:
+      linear-gradient(color-mix(in oklab, #ffffff 3%, transparent) 1px, transparent 1px),
+      linear-gradient(90deg, color-mix(in oklab, #ffffff 3%, transparent) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  .text-gradient {
+    background: linear-gradient(180deg, var(--color-frost), color-mix(in oklab, var(--color-frost) 55%, transparent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .scrollbar-slim::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar-slim::-webkit-scrollbar-thumb {
+    background: var(--color-raised); border-radius: 8px;
+  }
+  .scrollbar-slim::-webkit-scrollbar-track { background: transparent; }
+}
+
+/* Global slim scrollbars */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--color-raised); border-radius: 10px; border: 2px solid var(--color-abyss); }
+::-webkit-scrollbar-thumb:hover { background: var(--color-line); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Reveal-on-mount, honored only when motion allowed */
+@keyframes artha-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: artha-rise 0.5s var(--ease-out) both; }
+
+@keyframes artha-shimmer {
+  100% { transform: translateX(100%); }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--color-elevated);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, color-mix(in oklab, #ffffff 6%, transparent), transparent);
+  animation: artha-shimmer 1.6s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

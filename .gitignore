@@ -1,0 +1,101 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv
+ENV
+env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+db/*.db
+migrations/*.db
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Cache
+.cache/
+.pytest_cache/
+.CACHE
+
+# Jupyter
+.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ARTHA Terminal specific
+artha.db
+artha.db-wal
+artha.db-shm
+screener_cookies.json
+
+# Demo snapshots (contains real data)
+demo/*.tmp
+demo/*.json
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/*.tsbuildinfo
+.next/
+
+# Claude Code local config (machine-specific, not project code)
+.claude/
+.agents/
+.mcp.json
