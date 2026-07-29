@@ -3,7 +3,7 @@ ARTHA Terminal - every LLM call goes through the router, on free defaults
 
 Three regressions this pins, all found by inventorying the prompt sites:
 
-  1. Four services POSTed to a provider directly with a hardcoded model and
+  1. Five services POSTed to a provider directly with a hardcoded model and
      their own retry ladder, so they died when that one provider was
      rate-limited even with four other tiers idle.
   2. config.py declared free-tier model defaults on AIConfig, then overrode

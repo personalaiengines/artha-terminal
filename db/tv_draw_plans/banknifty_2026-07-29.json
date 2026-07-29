@@ -21,9 +21,9 @@
   ],
   "commands": [
     "symbol NSE:BANKNIFTY",
-    "draw shape --type horizontal_line --price 24000 --time 1785345370 --text 'ARTHA \u00b7 Max Pain' --overrides '{\"linecolor\": \"#FF2E86\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF2E86\", \"showPrice\": true}'",
-    "draw shape --type horizontal_line --price 25000 --time 1785345370 --text 'ARTHA \u00b7 Call OI Wall (R)' --overrides '{\"linecolor\": \"#FF3B4E\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF3B4E\", \"showPrice\": true}'",
-    "draw shape --type horizontal_line --price 23000 --time 1785345370 --text 'ARTHA \u00b7 Put OI Wall (S)' --overrides '{\"linecolor\": \"#21F3A0\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#21F3A0\", \"showPrice\": true}'"
+    "draw shape --type horizontal_line --price 24000 --time 1785346833 --text 'ARTHA \u00b7 Max Pain' --overrides '{\"linecolor\": \"#FF2E86\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF2E86\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 25000 --time 1785346833 --text 'ARTHA \u00b7 Call OI Wall (R)' --overrides '{\"linecolor\": \"#FF3B4E\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#FF3B4E\", \"showPrice\": true}'",
+    "draw shape --type horizontal_line --price 23000 --time 1785346833 --text 'ARTHA \u00b7 Put OI Wall (S)' --overrides '{\"linecolor\": \"#21F3A0\", \"linewidth\": 2, \"linestyle\": 0, \"textcolor\": \"#21F3A0\", \"showPrice\": true}'"
   ],
-  "generated_ist": "2026-07-29T22:46:10.095727+05:30"
+  "generated_ist": "2026-07-29T23:10:33.948741+05:30"
 }

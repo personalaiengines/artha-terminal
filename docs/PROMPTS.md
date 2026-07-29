@@ -3,7 +3,9 @@
 Every LLM call this project makes: what the prompt is, which model answers it,
 and which API key pays for it.
 
-Verified against the running system on 2026-07-29.
+Verified end to end against the running containers on 2026-07-29 — every path
+below was invoked and its answer checked for the failure modes the grounding
+rules exist to prevent (see §7).
 
 ---
 
@@ -160,13 +162,21 @@ text.
 Five services each make one grounded completion. All go through `complete()`, so
 all get the full tier chain and its cooldowns.
 
-| Service | Prompt | Shape |
-|---|---|---|
-| `services/stock_analysis_llm.py` | "rigorous, grounded equity analyst; never fabricate numbers, never give direct buy/sell advice" → 5-section stock read | `deep` |
-| `services/fno_narrative.py` | `_SYSTEM` — "rigorous, grounded senior F&O/derivatives strategist for Indian index options" → 5-section option-chain read | `deep` |
-| `services/market_news.py` | "financial news editor for Indian markets; rank and summarise search results; never fabricate facts, headlines or URLs" | `quick` |
-| `services/market_events.py` | "extract scheduled economic events from search results; return ONLY a JSON array; never invent events or dates" | `quick` |
-| `services/breadth.py` | "senior Indian equity market strategist; exactly two sentences on today's internals" | `quick` |
+| Service | Endpoint | Prompt | Shape |
+|---|---|---|---|
+| `services/stock_analysis_llm.py` | `/api/stock/{sym}/analysis` | "rigorous, grounded equity analyst; never fabricate numbers, never give direct buy/sell advice" → 5-section stock read | `deep` |
+| `services/fno_narrative.py` | `/api/fno/{index}/narrative` | `_SYSTEM` — "rigorous, grounded senior F&O/derivatives strategist for Indian index options" → 5-section option-chain read | `deep` |
+| `services/market_news.py` | `/api/news` | "financial news editor for Indian markets; rank and summarise search results; never fabricate facts, headlines or URLs" | `quick` |
+| `services/market_events.py` | `/api/events` | "extract scheduled economic events from search results; return ONLY a JSON array; never invent events or dates" | `quick` |
+| `services/breadth.py` | **none — see below** | "senior Indian equity market strategist; exactly two sentences on today's internals" | `quick` |
+
+`breadth.get_strategist_read()` has **no live caller**. It is exported and
+reachable, but `/api/pulse` does not return it and nothing in `api/` or `web/`
+requests it — the only import is
+`archive/streamlit-legacy/ui/components/market_pulse.py`, from the retired UI.
+It was rerouted through the router with the others for consistency; if the
+Market Breadth card ever wants a written read, it is ready to wire. Left in
+place rather than deleted because the archive still imports it.
 
 Until this was consolidated, each of these POSTed to a provider directly with a
 hardcoded model and its own retry ladder. Four were NIM-only, so they returned
@@ -199,6 +209,14 @@ block wording for the chat. Previously these were two independent texts and only
 the chat one was hardened, so the deep dive was still missing the rules written
 after live fabrication incidents.
 
+**Free tiers fail transiently, and that is priced in.** Observed on 2026-07-29:
+GitHub Models returned 429 on a deep call (cooled down 300s, OpenRouter served
+it) and SambaNova failed once with an empty error, presumably a timeout, before
+OpenRouter answered. Both were invisible to the caller — which is the point of
+the chain. A blank `str(e)` does not match any cooldown pattern, so that tier is
+retried on the next request rather than skipped; acceptable while such failures
+stay isolated, worth revisiting if a provider starts timing out steadily.
+
 **Free-tier models disregard negative instructions.** Observed while testing the
 screen intent: given a table with the P/E column removed and an explicit "do not
 supply a value", the models still emitted recalled-from-training P/Es. The fix
@@ -210,7 +228,55 @@ stating the principle abstractly.
 
 ---
 
-## 6. Non-LLM keys, for completeness
+## 6. Measured cost of each path
+
+Against the containers on 2026-07-29, warm (second call onward). The router's
+tier chain is the variable — a tier that has to fall through adds its own
+timeout before the next one answers.
+
+| Path | Latency | Notes |
+|---|---|---|
+| `/api/ai/stream` first token | **1.0s** | what the analyst page feels like |
+| `/api/ai` market | 1.2 – 1.9s | snapshot + web results |
+| `/api/ai` lookup | 1.4 – 2.6s | one fact from the DB |
+| `/api/ai` compare | 1.9 – 3.4s | two symbols side by side |
+| `/api/ai` screen | 5.7 – 7.2s | SQL table + commentary |
+| `/api/brief` | 4.6s cold, cached 15 min | 7-bullet round-up |
+| `/api/stock/{sym}/analysis` | 6.8s cold, cached 1h | |
+| `/api/fno/{index}/narrative` | 6.8s cold, cached 15 min | |
+| `/api/news` | 12.4s cold, cached 15 min | 6 web searches, then ranking |
+| `/api/events` | 24.6s cold, cached 1h | searches + extraction |
+| `/api/ai` deep dive | **126.6s** cold, 0.5s repeat | 8 tools + 3 debate calls, `agent_cache` 6h |
+
+The deep dive is the only genuinely slow path and it is inherent — eight tool
+calls and a three-call bull/bear/judge debate. It is served over
+`/api/ai/stream` in the UI, so the user watches each tool land rather than
+waiting on a spinner.
+
+Everything non-LLM stays far below this: all 20 API routes and all 6 web pages
+measured p50 ≤ 47ms warm, max 62ms (`/api/universe`, 5,173 rows). No endpoint
+exceeded 1s.
+
+---
+
+## 7. Verification
+
+`scripts/ai_check.py` invokes every path above and greps each answer for the
+fabrication patterns the grounding contract targets:
+
+- a source attributed to a broker/terminal that was never consulted
+  ("Kotak Neo", "Bloomberg terminal", …)
+- "cannot access real-time data" / "as an AI language model" — the model
+  disclaiming data it was actually handed
+- "traded in a range of" — an invented intraday range
+
+2026-07-29 run: all six AI paths and all four live service prompts clean, no
+pattern matched. Automated equivalents live in
+`tests/test_llm_routing_consistency.py` (139 tests pass).
+
+---
+
+## 8. Non-LLM keys, for completeness
 
 | Key | Used by | Purpose |
 |---|---|---|
