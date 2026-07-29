@@ -11,7 +11,7 @@ Layered by reliability:
        • international holidays — exchange_calendars
        • US Non-Farm Payrolls  — first-Friday rule
   2. AI-enriched macro (best-effort, cached): CPI / central-bank / GDP events
-     extracted by an NVIDIA NIM model from live SerpAPI results. Grounded on
+     extracted by the LLM ("quick" tier chain) from live SerpAPI results. Grounded on
      real search snippets and always carries the source link, but the model can
      still err — rows are labelled "AI" so the user verifies via the link.
 
@@ -27,7 +27,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from config import config
 
 
 # ------------------------------------------------------------------
@@ -215,39 +214,22 @@ def _recurring(days_ahead: int) -> list[dict]:
 # AI-enriched macro events (SerpAPI grounding + NVIDIA NIM extraction)
 # ------------------------------------------------------------------
 
-# Small fast NIM model for structured extraction (~1-3s vs ~90s for the 80B MoE).
-# The heavier config.ai chain is reserved for quality-sensitive SWOT/verdict work.
-_NIM_EXTRACT_MODEL = "meta/llama-3.1-8b-instruct"
-
-
 def _nim_extract(prompt: str, timeout: float = 40.0) -> str:
-    """One NVIDIA NIM completion (free tier). Returns raw text or ''."""
-    import httpx
-    key = config.ai.nvidia_api_key
-    if not key:
-        return ""
-    try:
-        r = httpx.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": _NIM_EXTRACT_MODEL,
-                "messages": [
-                    {"role": "system", "content":
-                        "You extract scheduled economic events from web search results. "
-                        "Return ONLY a JSON array. Never invent events or dates not present "
-                        "in the provided results."},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": 1500, "temperature": 0.1,
-            },
-            timeout=timeout,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        pass
-    return ""
+    """One completion through the router. Returns raw text or ''.
+
+    `timeout` is accepted for call-site compatibility; the router owns per-tier
+    timeouts now.
+    """
+    from agent.llm_client import complete
+
+    # "quick": structured extraction from pre-fetched snippets, short JSON out.
+    return complete(
+        "You extract scheduled economic events from web search results. "
+        "Return ONLY a JSON array. Never invent events or dates not present "
+        "in the provided results.",
+        prompt,
+        task_shape="quick",
+    )
 
 
 def _parse_ai_events(raw: str, region: str | None, days_ahead: int) -> list[dict]:

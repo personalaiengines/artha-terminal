@@ -4,6 +4,7 @@ OpenRouter and Nvidia NIM API support with automatic fallback.
 """
 
 import httpx
+import logging
 import json
 import time
 from abc import ABC, abstractmethod
@@ -563,3 +564,34 @@ class ModelRouter:
                 continue
 
         raise AllTiersExhausted(errors)
+
+def complete(system: str, user: str, task_shape: str = "quick") -> str:
+    """Synchronous one-shot completion through the router. Returns "" on failure.
+
+    Exists because four services used to reach past the router and POST to a
+    provider directly with a hardcoded model and their own retry ladder. That
+    gave them no tier fallback: each died when its one provider was rate-limited
+    even with four other tiers idle. They are sync call sites inside
+    run_in_executor threads, hence the private event loop rather than await.
+    """
+    import asyncio
+
+    async def _go() -> str:
+        resp = await ModelRouter().chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            task_shape=task_shape,
+        )
+        return (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_go())
+    except AllTiersExhausted as e:
+        logging.getLogger("agent.llm_client").warning(f"complete() exhausted all tiers: {e}")
+        return ""
+    except Exception as e:
+        logging.getLogger("agent.llm_client").warning(f"complete() failed: {e}")
+        return ""
+    finally:
+        loop.close()

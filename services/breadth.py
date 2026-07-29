@@ -276,41 +276,26 @@ def get_strategist_read(pulse: dict) -> dict:
         f"large-caps advancing). Leaders: {leaders}. Laggards: {laggards}."
     )
 
-    from config import config
-    key = config.ai.nvidia_api_key
-    if not key:
-        return {"text": fallback, "ai": False}
+    from agent.llm_client import complete
 
     prompt = (
-        "You are a senior Indian equity market strategist. In EXACTLY two crisp "
-        "sentences, interpret today's market internals — comment on whether the move "
-        "is broad or narrow, any sector rotation, and the risk tone. Be specific and "
-        "professional. No preamble, no disclaimers, no buy/sell advice.\n\n"
         f"Indices: {idx_line}.\n"
         f"Breadth: {b.get('pct', 0)}% advancing ({b.get('advancing', 0)} of {b.get('total', 0)} large-caps).\n"
         f"Leading sectors: {leaders}.\n"
         f"Lagging sectors: {laggards}."
     )
 
-    try:
-        import httpx
-        r = httpx.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": "meta/llama-3.1-8b-instruct",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 160, "temperature": 0.4,
-            },
-            timeout=30.0,
-        )
-        if r.status_code == 200:
-            text = r.json()["choices"][0]["message"]["content"].strip()
-            if text:
-                return {"text": text, "ai": True}
-    except Exception:
-        pass
-    return {"text": fallback, "ai": False}
+    # "quick": two sentences off a small facts block. Falls back to the
+    # deterministic breadth line rather than showing nothing.
+    text = complete(
+        "You are a senior Indian equity market strategist. In EXACTLY two crisp "
+        "sentences, interpret today's market internals — comment on whether the move "
+        "is broad or narrow, any sector rotation, and the risk tone. Be specific and "
+        "professional. No preamble, no disclaimers, no buy/sell advice.",
+        prompt,
+        task_shape="quick",
+    ).strip()
+    return {"text": text, "ai": True} if text else {"text": fallback, "ai": False}
 
 
 __all__ = ["get_market_pulse", "get_strategist_read"]

@@ -1,20 +1,17 @@
 """
 ARTHA Terminal - F&O narrative (grounded)
 
-Takes the deterministic F&O game plan (services.fno_analysis) and asks the
-configured OpenRouter model (config.ai.primary_model — a free-tier model by
-default) to write a senior-derivatives-analyst read. The model is given ONLY
-the computed numbers and told not to invent anything — the maths is done in
-Python, the LLM only interprets. Educational/SEBI-safe, never a buy/sell call.
-Falls back to the OpenRouter fallback model, then NVIDIA NIM, if the primary
-model is unavailable.
+Takes the deterministic F&O game plan (services.fno_analysis) and asks the LLM
+to write a senior-derivatives-analyst read. The model is given ONLY the
+computed numbers and told not to invent anything — the maths is done in Python,
+the LLM only interprets. Educational/SEBI-safe, never a buy/sell call.
+
+Runs on agent.llm_client's "deep" tier chain, so provider fallback and
+rate-limit cooldowns are handled in one place rather than here.
 """
 
 from __future__ import annotations
 
-import re
-import httpx
-from config import config
 
 _SYSTEM = (
     "You are a rigorous, grounded senior F&O/derivatives strategist for Indian "
@@ -86,98 +83,23 @@ def _build_prompt(plan: dict) -> str:
     )
 
 
-def _openrouter(model: str, prompt: str, timeout: float, max_tokens: int = 700) -> str:
-    key = config.ai.openrouter_api_key
-    if not key:
-        return ""
-
-    def _call(mt: int):
-        return httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "HTTP-Referer": "https://artha.local",
-                "X-Title": "ARTHA Terminal",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": mt, "temperature": 0.3,
-            },
-            timeout=timeout,
-        )
-
-    try:
-        r = _call(max_tokens)
-        # Free-tier rate/credit ceiling → 402 "can only afford N tokens".
-        # Retry within budget instead of dropping straight to the next model.
-        if r.status_code == 402:
-            m = re.search(r"can only afford (\d+)", r.text)
-            afford = int(m.group(1)) - 24 if m else 0
-            if afford >= 200:
-                r = _call(afford)
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return ""
-    return ""
-
-
-def _nim(model: str, prompt: str, timeout: float) -> str:
-    key = config.ai.nvidia_api_key
-    if not key:
-        return ""
-    try:
-        r = httpx.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": 1000, "temperature": 0.3,
-            },
-            timeout=timeout,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return ""
-    return ""
-
-
 def get_fno_narrative(plan: dict) -> dict:
     """
     Grounded senior-analyst narrative for one index's game plan.
 
-    config.ai.primary_model (OpenRouter, free-tier) first, then the OpenRouter
-    fallback model, then NVIDIA NIM. Returns {"markdown", "ok", "model"}.
+    Runs on the router's "deep" chain. This used to hand-roll its own ladder —
+    OpenRouter primary x3, OpenRouter fallback, then one NIM model — which the
+    router already does, plus GitHub Models and SambaNova, plus cooldowns for
+    tiers that have started 429ing. Returns {"markdown", "ok", "model"}.
     """
+    from agent.llm_client import complete
+
     if not plan or not plan.get("ok"):
         return {"markdown": "", "ok": False, "model": None}
 
-    prompt = _build_prompt(plan)
-
-    # Primary OpenRouter model first — retried, since free-tier endpoints
-    # occasionally reset the connection under load; only then fall back so the
-    # primary model is genuinely used, not skipped on a transient blip. Then
-    # the OpenRouter fallback model, then NVIDIA NIM.
-    attempts = [
-        (_openrouter, config.ai.primary_model, 90.0, 3),
-        (_openrouter, config.ai.fallback_model_1, 60.0, 1),
-        (_nim, "meta/llama-3.3-70b-instruct", 90.0, 1),
-    ]
-    for fn, model, timeout, tries in attempts:
-        for _ in range(tries):
-            text = fn(model, prompt, timeout)
-            if text and len(text) > 120:
-                return {"markdown": _clean(text), "ok": True, "model": model}
+    text = complete(_SYSTEM, _build_prompt(plan), task_shape="deep")
+    if text and len(text) > 120:
+        return {"markdown": _clean(text), "ok": True, "model": "router"}
     return {"markdown": "", "ok": False, "model": None}
 
 

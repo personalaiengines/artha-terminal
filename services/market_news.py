@@ -4,7 +4,7 @@ ARTHA Terminal - Live Market News service
 Pipeline (all live, no pre-populated cache required):
   1. Fetch  — open-source web search (SerpAPI primary → SearxNG fallback) across
               a few Indian-market queries. SearchService already caches results.
-  2. Curate — an NVIDIA NIM model (free tier) ranks/dedupes the raw hits into the
+  2. Curate — the LLM ("quick" tier chain) ranks/dedupes the raw hits into the
               most market-relevant headlines, each with a one-line "why it matters".
               Strictly grounded: the model may only use the provided results.
   3. Fallback — if the LLM is unavailable, we still return the raw search hits so
@@ -21,10 +21,6 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import config
-
-# Fast NIM model — good enough for ranking/summarising, ~1-3s typical.
-_NIM_MODEL = "meta/llama-3.1-8b-instruct"
 
 # Queries span the whole market: indices, sectors, macro/policy, flows, earnings
 # and corporate action — so the feed (and the UI category tabs) cover the full
@@ -105,11 +101,10 @@ def _gather() -> list[dict]:
 
 
 def _nim_curate(raw: list[dict], limit: int) -> list[dict]:
-    """Ask NIM to pick + summarise the most market-relevant headlines. [] on failure."""
-    import httpx
+    """Rank + summarise the most market-relevant headlines. [] on failure."""
+    from agent.llm_client import complete
 
-    key = config.ai.nvidia_api_key
-    if not key or not raw:
+    if not raw:
         return []
 
     lines = "\n".join(
@@ -129,28 +124,14 @@ def _nim_curate(raw: list[dict], limit: int) -> list[dict]:
     )
 
     def _post() -> str:
-        try:
-            r = httpx.post(
-                "https://integrate.api.nvidia.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": _NIM_MODEL,
-                    "messages": [
-                        {"role": "system", "content":
-                            "You are a financial news editor for Indian markets. You rank and "
-                            "summarise search results. You never fabricate facts, headlines, or "
-                            "URLs — only use what is provided."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 1200, "temperature": 0.2,
-                },
-                timeout=45.0,
-            )
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
-        except Exception:
-            return ""
-        return ""
+        # "quick": ranking pre-fetched snippets, short output, latency matters.
+        return complete(
+            "You are a financial news editor for Indian markets. You rank and "
+            "summarise search results. You never fabricate facts, headlines, or "
+            "URLs — only use what is provided.",
+            prompt,
+            task_shape="quick",
+        )
 
     valid_links = {r["link"] for r in raw if r.get("link")}
 

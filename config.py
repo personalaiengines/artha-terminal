@@ -172,14 +172,19 @@ class Config:
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             nvidia_api_key=os.getenv("NVIDIA_API_KEY"),
-            primary_model=os.getenv("OPENROUTER_PRIMARY_MODEL", "anthropic/claude-sonnet-4.5"),
-            fallback_model_1=os.getenv("OPENROUTER_FALLBACK_MODEL", "google/gemini-2.5-flash"),
-            fallback_model_2=os.getenv("NVIDIA_FALLBACK_MODEL", "meta/llama-3.1-405b-instruct"),
-            fallback_model_3=os.getenv("NVIDIA_BACKUP_MODEL", "meta/llama-3.3-70b-instruct"),
+            # `or AIConfig.<field>` rather than a literal getenv default: the
+            # literals here used to be anthropic/claude-sonnet-4.5 and
+            # google/gemini-2.5-flash, which silently overrode the free-tier
+            # defaults declared on AIConfig and billed anyone who set only an
+            # OpenRouter key. One source of truth, and it is the free one.
+            primary_model=os.getenv("OPENROUTER_PRIMARY_MODEL") or AIConfig.primary_model,
+            fallback_model_1=os.getenv("OPENROUTER_FALLBACK_MODEL") or AIConfig.fallback_model_1,
+            fallback_model_2=os.getenv("NVIDIA_FALLBACK_MODEL") or AIConfig.fallback_model_2,
+            fallback_model_3=os.getenv("NVIDIA_BACKUP_MODEL") or AIConfig.fallback_model_3,
             sambanova_api_key=os.getenv("SAMBANOVA_API_KEY"),
-            sambanova_model=os.getenv("SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct"),
+            sambanova_model=os.getenv("SAMBANOVA_MODEL") or AIConfig.sambanova_model,
             github_models_token=os.getenv("GITHUB_MODELS_TOKEN"),
-            github_models_model=os.getenv("GITHUB_MODELS_MODEL", "Llama-3.3-70B-Instruct"),
+            github_models_model=os.getenv("GITHUB_MODELS_MODEL") or AIConfig.github_models_model,
         )
         self.search = SearchConfig(
             serpapi_key=os.getenv("SERPAPI_KEY"),

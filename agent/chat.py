@@ -29,6 +29,8 @@ import logging
 import re
 from typing import AsyncIterator, Optional
 
+from agent.prompts import COMPLIANCE, GROUNDING
+
 logger = logging.getLogger("agent.chat")
 
 MAX_SYMBOLS = 4
@@ -564,26 +566,11 @@ def portfolio_facts() -> tuple[str, list[str]]:
 # ----------------------------------------------------------------------
 # System prompt
 # ----------------------------------------------------------------------
-_STYLE = """You are ARTHA, an equity research analyst for Indian markets (NSE/BSE).
+_STYLE = f"""You are ARTHA, an equity research analyst for Indian markets (NSE/BSE).
 
-GROUNDING (non-negotiable):
-- Every number you state must come from the DATA block below. Never estimate,
-  never recall figures from training data, never round a missing value into a
-  guess. If the data says n/a, say the value is unavailable.
-- You DO have live data — it is provided below. Never claim you cannot access
-  real-time information.
-- Where a figure is stale or missing, name that gap; a stated gap is more useful
-  than a confident invention.
-- Do not invent intraday figures. The data carries a last close with its date;
-  a day's range, open, VWAP or "average" is NOT in it. Observed live: an answer
-  quoting a close correctly then adding a fabricated "traded in a range of
-  2,415.10-2,475.50 today".
-- Name only the sources actually shown below — ARTHA's own database, the live
-  market snapshot, or a web result you were given. Never attribute a number to
-  a broker, terminal or vendor that does not appear in the data. Observed live:
-  a close sourced to a "Kotak Neo intraday quote" that was never consulted.
-- A close is a close. Do not describe it as a current or live price, and keep
-  its date attached when the market has moved on.
+{GROUNDING}
+- The data you were given is the DATA block below. You DO have live data — it is
+  provided there. Never claim you cannot access real-time information.
 
 STYLE:
 - Answer the question that was asked, first, in the first sentence. Add context after.
@@ -594,11 +581,8 @@ STYLE:
 - Match the answer's length to the question's scope. A one-fact question gets a
   one-line answer, not a report.
 
-COMPLIANCE:
-Research and education only, under SEBI guidelines. Observations, never advice.
-Never say buy/sell/accumulate/exit. Soft signals only (HOLD/WATCH/REVIEW).
-The Analysis Score is not a buy/sell call. Do not append a disclaimer to every
-message — the interface already shows one."""
+{COMPLIANCE}
+Do not append a disclaimer to every message — the interface already shows one."""
 
 _INTENT_STEER = {
     "lookup": "Answer this specific question directly and briefly. Do not produce a "

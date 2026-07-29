@@ -18,7 +18,7 @@ on rate limits rather than failing.
 | Nvidia NIM | `integrate.api.nvidia.com/v1/chat/completions` | `NVIDIA_API_KEY` | set |
 | SambaNova | `api.sambanova.ai/v1/chat/completions` | `SAMBANOVA_API_KEY` | set |
 | GitHub Models | `models.inference.ai.azure.com/chat/completions` | `GITHUB_MODELS_TOKEN` | set |
-| Anthropic | `api.anthropic.com` | `ANTHROPIC_API_KEY` | **empty — and never reached, see §5** |
+| Anthropic | `api.anthropic.com` | `ANTHROPIC_API_KEY` | empty — opt-in override, see §5 |
 
 ### Model names in force
 
@@ -34,10 +34,12 @@ Defaults live in `config.py`; `.env` overrides them. Current values:
 | `GITHUB_MODELS_MODEL` | `Llama-3.3-70B-Instruct` | GitHub Models |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | Anthropic (unused) |
 
-Note the code defaults in `config.py` (`anthropic/claude-sonnet-4.5`,
-`google/gemini-2.5-flash`) are paid models and would be used by anyone who
-copies `.env.example` without setting these — the free Nemotron models are an
-`.env` choice on this machine, not the shipped default.
+These are also the shipped defaults. `Config.__init__` used to pass
+`os.getenv(..., "anthropic/claude-sonnet-4.5")`, whose literal always beat the
+free defaults declared on `AIConfig` — so anyone who copied `.env.example` and
+added only an OpenRouter key was billed for Claude. It now reads
+`os.getenv(...) or AIConfig.<field>`, making the dataclass the single source and
+the free model the default.
 
 ---
 
@@ -72,6 +74,23 @@ SambaNova appears at both ends of the deep chain: it is a separate free quota
 pool from OpenRouter and NIM, so it is worth keeping as a last resort. When
 every tier is exhausted the router raises `AllTiersExhausted` and the UI says so
 plainly rather than degrading silently.
+
+A tier that 429s or 404s is put on a cooldown (300s for a quota hit) so it
+doesn't cost a guaranteed-fail round trip on the next request. Self-healing —
+no config edit needed.
+
+**Anthropic sits outside the chain.** `chat()` and `tool_use_loop()` try it
+*first* when `ANTHROPIC_API_KEY` is set, falling through to the free chain if it
+errors. `stream()` deliberately skips it — different wire format, and the
+conversational path is free-chain by design. So setting that key changes
+`/api/ai` and the deep dive but not the streaming analyst.
+
+### `complete()` — the sync entry point
+
+`agent/llm_client.py::complete(system, user, task_shape)` runs one exchange
+through the router from synchronous code and returns `""` on total failure
+rather than raising. Services that need a single completion use this; it is what
+replaced their hand-rolled provider ladders.
 
 ---
 
@@ -136,53 +155,58 @@ text.
 
 ---
 
-## 4. Prompts that bypass the router
+## 4. Service prompts
 
-Four services call providers directly over `httpx` with their own hardcoded
-model, endpoint and fallback ladder. They do **not** get the router's tier
-chain, so they fail when their specific provider is rate-limited even if other
-tiers are free.
+Five services each make one grounded completion. All go through `complete()`, so
+all get the full tier chain and its cooldowns.
 
-| Service | Prompt | Model(s) | Key |
-|---|---|---|---|
-| `services/stock_analysis_llm.py` | "rigorous, grounded equity analyst; never fabricate numbers, never give direct buy/sell advice" | `meta/llama-3.3-70b-instruct` → `meta/llama-3.1-8b-instruct` | `NVIDIA_API_KEY` |
-| `services/market_news.py` | "financial news editor for Indian markets; rank and summarise search results; never fabricate facts, headlines or URLs" | `meta/llama-3.1-8b-instruct` | `NVIDIA_API_KEY` |
-| `services/market_events.py` | "extract scheduled economic events from search results; return ONLY a JSON array; never invent events or dates" | `meta/llama-3.1-8b-instruct` | `NVIDIA_API_KEY` |
-| `services/fno_narrative.py` | `_SYSTEM` — "rigorous, grounded senior F&O/derivatives strategist for Indian index options; never fabricate numbers, never give direct buy/sell advice" | `config.ai.primary_model` → `fallback_model_1` → `meta/llama-3.3-70b-instruct` | `OPENROUTER_API_KEY`, then `NVIDIA_API_KEY` |
+| Service | Prompt | Shape |
+|---|---|---|
+| `services/stock_analysis_llm.py` | "rigorous, grounded equity analyst; never fabricate numbers, never give direct buy/sell advice" → 5-section stock read | `deep` |
+| `services/fno_narrative.py` | `_SYSTEM` — "rigorous, grounded senior F&O/derivatives strategist for Indian index options" → 5-section option-chain read | `deep` |
+| `services/market_news.py` | "financial news editor for Indian markets; rank and summarise search results; never fabricate facts, headlines or URLs" | `quick` |
+| `services/market_events.py` | "extract scheduled economic events from search results; return ONLY a JSON array; never invent events or dates" | `quick` |
+| `services/breadth.py` | "senior Indian equity market strategist; exactly two sentences on today's internals" | `quick` |
 
-`fno_narrative` is the only one of the four with cross-provider fallback, and it
-handles OpenRouter's free-tier 402 ("can only afford N tokens") by retrying
-within budget rather than dropping a tier.
+Until this was consolidated, each of these POSTed to a provider directly with a
+hardcoded model and its own retry ladder. Four were NIM-only, so they returned
+nothing whenever NIM was rate-limited even with four other tiers idle;
+`fno_narrative` was the only one that crossed providers. `tests/
+test_llm_routing_consistency.py` fails if a direct provider URL reappears in any
+of them.
+
+All five degrade honestly when `complete()` returns `""` — `breadth` falls back
+to its deterministic breadth line, the others report `ok: False` and the UI
+shows the underlying data without commentary.
 
 ---
 
-## 5. Known inconsistencies
+## 5. Design notes and remaining caveats
 
-These are real, currently true, and not yet fixed.
+**Anthropic is an opt-in override, not a chain member.** `get_tier_chain()` has
+no Anthropic branch, but `ModelRouter.chat()` and `tool_use_loop()` both try
+`self.anthropic` ahead of the chain when `ANTHROPIC_API_KEY` is set, falling
+through on error. `stream()` skips it deliberately (documented in its
+docstring): different wire format, and the conversational path is free-chain by
+design. Consequence worth knowing — setting that key changes `/api/ai` and the
+deep dive, but the streaming analyst stays on the free chain.
 
-**Anthropic is configured but unreachable.** `config.has_anthropic` and an
-`AnthropicClient` both exist, and `ANTHROPIC_MODEL=claude-sonnet-5` is set — but
-`get_tier_chain()` never appends an Anthropic tier, so no code path can reach it.
-`ANTHROPIC_API_KEY` is empty here anyway, so nothing breaks; the dead branch is
-just misleading.
-
-**Four services bypass the router** (§4). Each re-implements its own retry
-ladder, and three of them have no fallback beyond a smaller NIM model. Routing
-them through `ModelRouter` would give them the full chain and delete three
-hand-rolled ladders.
-
-**Two grounding contracts exist.** `agent/prompts.py::BASE_SYSTEM_PROMPT` (the
-tool-loop deep dive) and `agent/chat.py::_STYLE` (everything conversational) say
-similar things in different words. `_STYLE` is the hardened one — it carries the
-rules added after live failures (no invented intraday figures, no invented
-sources). `BASE_SYSTEM_PROMPT` has not had the same treatment.
+**One grounding contract, composed twice.** `agent/prompts.py::GROUNDING` and
+`COMPLIANCE` hold the shared rules; `BASE_SYSTEM_PROMPT` and
+`agent/chat.py::_STYLE` each interpolate them and add what is specific to their
+path — tool-citation discipline (`[Source: <tool>]`) for the deep dive, DATA
+block wording for the chat. Previously these were two independent texts and only
+the chat one was hardened, so the deep dive was still missing the rules written
+after live fabrication incidents.
 
 **Free-tier models disregard negative instructions.** Observed while testing the
 screen intent: given a table with the P/E column removed and an explicit "do not
 supply a value", the models still emitted recalled-from-training P/Es. The fix
 was structural, not textual — screen tables are now rendered from SQL and shown
 to the user directly, with the model writing only the commentary. Treat prompt
-instructions as guidance, not as a guarantee, on this tier of model.
+instructions as guidance, not as a guarantee, on this tier of model. This is the
+main reason the grounding rules cite specific observed failures rather than
+stating the principle abstractly.
 
 ---
 

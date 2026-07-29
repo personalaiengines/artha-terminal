@@ -11,11 +11,6 @@ Open-source / free tier: NVIDIA NIM. Falls back gracefully if unavailable.
 
 from __future__ import annotations
 
-from config import config
-
-# Larger NIM model for a better-quality narrative (slower than the 8B extractor).
-_NIM_MODEL = "meta/llama-3.3-70b-instruct"
-
 
 def _fmt(v, suffix="", na="n/a"):
     if v is None:
@@ -66,10 +61,9 @@ def get_llm_analysis(snap: dict) -> dict:
 
     Returns {"markdown": str, "ok": bool, "model": str}.
     """
-    import httpx
+    from agent.llm_client import complete
 
-    key = config.ai.nvidia_api_key
-    if not key or not snap:
+    if not snap:
         return {"markdown": "", "ok": False, "model": None}
 
     facts = _facts_block(snap)
@@ -91,34 +85,16 @@ def get_llm_analysis(snap: dict) -> dict:
         f"investment advice."
     )
 
-    def _post(model: str, timeout: float) -> str:
-        try:
-            r = httpx.post(
-                "https://integrate.api.nvidia.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content":
-                            "You are a rigorous, grounded equity analyst. You never fabricate "
-                            "numbers and never give direct buy/sell advice."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 900, "temperature": 0.3,
-                },
-                timeout=timeout,
-            )
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
-        except Exception:
-            return ""
-        return ""
-
-    # Try the 70B model; if it's unavailable, fall back to the fast 8B one.
-    for model, timeout in ((_NIM_MODEL, 90.0), ("meta/llama-3.1-8b-instruct", 45.0)):
-        text = _post(model, timeout)
-        if text and len(text) > 120:
-            return {"markdown": _clean(text), "ok": True, "model": model}
+    # "deep": five sections over a full facts block. The router's own chain
+    # replaces the 70B -> 8B ladder this used to hand-roll against NIM alone.
+    text = complete(
+        "You are a rigorous, grounded equity analyst. You never fabricate "
+        "numbers and never give direct buy/sell advice.",
+        prompt,
+        task_shape="deep",
+    )
+    if text and len(text) > 120:
+        return {"markdown": _clean(text), "ok": True, "model": "router"}
     return {"markdown": "", "ok": False, "model": None}
 
 

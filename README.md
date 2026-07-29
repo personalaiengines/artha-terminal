@@ -288,9 +288,9 @@ all overridable in `.env`. If every tier is exhausted the UI says so plainly
 rather than failing silently.
 
 **[docs/PROMPTS.md](docs/PROMPTS.md)** documents every LLM call in the project —
-the prompt, the model that answers it, and the key that pays for it — plus the
-known inconsistencies (four services bypass the router; Anthropic is configured
-but unreachable).
+the prompt, the model that answers it, and the key that pays for it — plus both
+tier chains and how Anthropic's opt-in override differs across chat, streaming
+and the tool loop.
 
 ### Intent routing
 
