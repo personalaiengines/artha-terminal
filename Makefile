@@ -1,22 +1,34 @@
 # ============================================
 # ARTHA Terminal - Docker Makefile
 # ============================================
-# Usage:
-#   make build       - Build the Docker image
-#   make up          - Start all services in background
-#   make down        - Stop all services
-#   make restart     - Restart all services
-#   make logs        - Tail container logs
-#   make shell       - Open a bash shell inside the container
-#   make init-db     - Initialize/reset the database
-#   make test        - Run tests inside the container
-#   make clean       - Remove all containers and volumes
+# Services are `api` (Starlette, :8000) and `web` (Next.js, :3000).
+# There is no service called `artha` — that was the single-container Streamlit
+# era, and every target here used to point at it, so none of them ran.
+#
+#   make up          - Start both services
+#   make down        - Stop (the database volume survives)
+#   make build       - Rebuild both images
+#   make build-api   - Rebuild just the API (after a Python change)
+#   make build-web   - Rebuild just the UI (after a web/ change)
+#   make logs        - Tail both; logs-api / logs-web for one
+#   make shell       - Shell inside the API container
+#   make test        - Run pytest inside the API container
+#   make ingest      - One-shot symbol + price + fundamentals ingestion
+#   make db-status   - Row counts for every table in the LIVE database
+#   make init-db     - Create/migrate the schema
+#   make clean       - down -v + remove images  (DESTROYS the database)
 
-.PHONY: build up down restart logs shell init-db test clean
+.PHONY: build build-api build-web up down restart logs logs-api logs-web \
+        shell test init-db db-status ingest populate clean rebuild
 
-# Default target
 build:
-	docker build -t artha-terminal .
+	docker compose build
+
+build-api:
+	docker compose build api && docker compose up -d api
+
+build-web:
+	docker compose build web && docker compose up -d web
 
 up:
 	docker compose up -d
@@ -24,47 +36,42 @@ up:
 down:
 	docker compose down
 
-restart: down up
+restart:
+	docker compose restart
 
 logs:
 	docker compose logs -f
 
-shell:
-	docker compose exec artha sh
+logs-api:
+	docker compose logs -f api
 
-init-db:
-	docker compose exec artha python -c "from db import init_database; init_database()"
+logs-web:
+	docker compose logs -f web
+
+shell:
+	docker compose exec api sh
 
 test:
-	docker compose exec artha pytest tests/ -v
+	docker compose exec api pytest tests/ -q
 
-clean:
-	docker compose down -v
-	docker rmi artha-terminal 2>/dev/null || true
+init-db:
+	docker compose exec api python -c "from db import init_database; print(init_database())"
 
-# Build with no cache (fresh install)
-rebuild:
-	docker compose down -v
-	docker build --no-cache -t artha-terminal .
-	docker compose up -d
-
-# One-shot ingestion of symbols + prices + fundamentals
 ingest:
-	docker compose exec artha python scripts/ingest_all.py
+	docker compose exec api python scripts/ingest_all.py
 
-# Run full ingestion (same as 'ingest')
 populate: ingest
 
-# Inspect database
+# Row counts for the volume-backed database the app actually reads,
+# not the repo's db/artha.db. Prints which file answered.
 db-status:
-	docker compose exec artha python -c "
-from db import get_db_connection
-with get_db_connection() as conn:
-    cursor = conn.cursor()
-    cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")
-    tables = cursor.fetchall()
-    print('Tables:', [t[0] for t in tables])
-    for t in tables:
-        cursor.execute(f'SELECT COUNT(*) FROM {t[0]}')
-        print(f'  {t[0]}: {cursor.fetchone()[0]} rows')
-"
+	docker compose exec api python scripts/db_status.py
+
+# Destroys the database volume.
+clean:
+	docker compose down -v
+	-docker rmi artha-api artha-web 2>/dev/null
+
+rebuild:
+	docker compose build --no-cache
+	docker compose up -d
