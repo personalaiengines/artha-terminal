@@ -9,6 +9,7 @@ import { HBars } from "@/components/ui/chart";
 import { OptionChain } from "@/components/widgets/option-chain";
 import { FnoNarrative } from "@/components/widgets/fno-narrative";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 
 // Only index option chains are wired (services/upstox.py FNO_UNDERLYINGS) —
 // single-stock options aren't supported by the backend yet.
@@ -19,7 +20,7 @@ type Plan = { ok: boolean; spot: number; atm: number; iv: number; rows: OCRow[];
 
 export default function Options() {
   const [u, setU] = useState("NIFTY");
-  const live = useApi<Plan | null>(`/api/fno/${u}`, null, (j) => (j.ok ? j : null));
+  const live = useApi<Plan | null>(`/api/fno/${u}`, null, (j) => (j.ok ? j : null), POLL.fno);
 
   const header = (
     <PageHeader eyebrow="Derivatives" title="Options Chain"

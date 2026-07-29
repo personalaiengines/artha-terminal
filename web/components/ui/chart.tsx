@@ -1,7 +1,7 @@
 "use client";
 import {
   Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid,
-  PieChart, Pie, Cell, BarChart, Bar,
+  PieChart, Pie, Cell, BarChart, Bar, Line, LineChart, ReferenceLine,
 } from "recharts";
 import { ReactNode } from "react";
 
@@ -50,6 +50,55 @@ export function AreaPrice({
         />
         <Area type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} fill={`url(#ap-${dataKey}-${up})`} animationDuration={900} dot={false} activeDot={{ r: 3, fill: color, stroke: "var(--color-abyss)", strokeWidth: 2 }} />
       </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+// Several series on one set of axes, for comparing things measured in
+// different units (index levels rebased to a common start). Distinct from
+// AreaPrice, which is deliberately single-series and gradient-filled.
+export function MultiLine({
+  data, series, xKey = "t", height = 260,
+  valueFmt = (v: number) => v.toFixed(1),
+}: {
+  data: Record<string, unknown>[];
+  series: { key: string; label: string; color: string }[];
+  xKey?: string; height?: number; valueFmt?: (v: number) => string;
+}) {
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <LineChart data={data} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
+        <CartesianGrid {...GRID} />
+        <XAxis dataKey={xKey} {...AXIS} minTickGap={48} />
+        <YAxis {...AXIS} domain={["auto", "auto"]} width={44} orientation="right"
+               tickFormatter={(v) => valueFmt(Number(v))} />
+        {/* The rebase baseline: above it the index is up over the window. */}
+        <ReferenceLine y={100} stroke="var(--color-line)" strokeDasharray="3 3" />
+        <Tooltip
+          cursor={{ stroke: "var(--color-muted)", strokeDasharray: "3 3" }}
+          content={({ active, payload, label }) =>
+            active && payload?.length ? (
+              <TooltipBox>
+                <div className="mb-1 text-muted">{String(label)}</div>
+                {payload.map((p) => (
+                  <div key={String(p.dataKey)} className="flex items-center gap-2">
+                    <span className="h-2 w-2 rounded-full" style={{ background: p.color as string }} />
+                    <span className="text-mist">{series.find((s) => s.key === p.dataKey)?.label}</span>
+                    <span className="ml-auto font-semibold text-frost tnum">
+                      {(Number(p.value) - 100) >= 0 ? "+" : ""}{(Number(p.value) - 100).toFixed(2)}%
+                    </span>
+                  </div>
+                ))}
+              </TooltipBox>
+            ) : null
+          }
+        />
+        {series.map((s) => (
+          <Line key={s.key} type="monotone" dataKey={s.key} stroke={s.color} strokeWidth={2}
+                dot={false} animationDuration={900}
+                activeDot={{ r: 3, fill: s.color, stroke: "var(--color-abyss)", strokeWidth: 2 }} />
+        ))}
+      </LineChart>
     </ResponsiveContainer>
   );
 }

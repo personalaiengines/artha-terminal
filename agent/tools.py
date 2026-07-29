@@ -268,7 +268,13 @@ async def get_price_history(
         df = df[df["date"] <= end_date]
     # Cap the payload back to the LLM — it doesn't need 5 years of daily candles.
     rows = df.tail(180).to_dict("records")
-    return {"symbol": symbol, "data": rows, "metrics": snap["metrics"], "status": "OK"}
+    # `data` is ascending (oldest first, most recent last) — free-tier models
+    # were observed citing an early/arbitrary row as "latest" instead of
+    # scanning to the end of a 180-row array. Surface latest_close/latest_date
+    # as explicit top-level fields so there's nothing to infer.
+    return {"symbol": symbol, "data": rows, "metrics": snap["metrics"],
+            "latest_close": snap.get("latest_close"), "latest_date": snap.get("latest_date"),
+            "status": "OK"}
 
 
 @registry.register

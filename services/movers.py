@@ -92,7 +92,7 @@ def _from_yfinance(top_n: int) -> dict | None:
     warnings.filterwarnings("ignore")
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     import yfinance as yf
-    from services.nifty50 import broad_universe
+    from services.constituents import broad_universe
 
     syms = broad_universe()
     tickers = [f"{s}.NS" for s in syms]
@@ -135,8 +135,35 @@ def _from_yfinance(top_n: int) -> dict | None:
         "gainers": moves[:top_n],
         "losers": sorted(moves, key=lambda x: x["pct"])[:top_n],
         "volume": volume[:top_n],
+        # Every priced symbol, not just the extremes — the per-index/sector
+        # slices below are cut from this.
+        "all_moves": moves,
         "source": f"yfinance · NIFTY-100+ universe ({len(moves)} stocks)",
     }
+
+
+def _group_movers(moves: list[dict], top_n: int) -> dict[str, dict]:
+    """Split one priced universe into per-index / per-sector gainers & losers.
+
+    Membership comes from the index_members table (official NSE constituent
+    CSVs, ingested by ingestion/index_members.py). Groups with fewer than two
+    priced members are dropped rather than rendered as a near-empty tab.
+    """
+    from services.constituents import groups
+
+    by_symbol = {m["symbol"]: m for m in moves}
+    out: dict[str, dict] = {}
+    for name, members in groups().items():
+        rows = [by_symbol[s] for s in members if s in by_symbol]
+        if len(rows) < 2:
+            continue
+        rows.sort(key=lambda x: x["pct"], reverse=True)
+        out[name] = {
+            "gainers": [r for r in rows if r["pct"] > 0][:top_n],
+            "losers": [r for r in reversed(rows) if r["pct"] < 0][:top_n],
+            "count": len(rows),
+        }
+    return out
 
 
 # ------------------------------------------------------------------
@@ -154,6 +181,7 @@ def get_top_movers(top_n: int = 10) -> dict:
     Returns:
         {"gainers": [{symbol, pct, price}], "losers": [...],
          "volume": [{symbol, volume, price, pct, value_cr}],
+         "groups": {"NIFTY 50": {gainers, losers, count}, "IT": {...}, ...},
          "source": str, "generated_ist": iso, "ok": bool}
     """
     yf_result = _from_yfinance(top_n)
@@ -169,9 +197,14 @@ def get_top_movers(top_n: int = 10) -> dict:
         result = nse or yf_result
 
     if not result:
-        return {"gainers": [], "losers": [], "volume": [], "source": None, "ok": False,
+        return {"gainers": [], "losers": [], "volume": [], "groups": {},
+                "source": None, "ok": False,
                 "generated_ist": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()}
 
+    # Always from the yfinance pass: NSE only returns the market-wide extremes,
+    # which is far too few rows to cut an index or sector slice from.
+    result["groups"] = _group_movers((yf_result or {}).get("all_moves") or [], top_n)
+    result.pop("all_moves", None)
     result.setdefault("volume", [])
     result["ok"] = True
     result["generated_ist"] = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()

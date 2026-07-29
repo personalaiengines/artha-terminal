@@ -8,7 +8,9 @@ export async function GET() {
   const norm = (arr: any[] = []) => arr.map((r) => ({
     name: r.name, symbol: r.symbol, unit: r.unit ?? null,
     price: r.price ?? null, changePct: r.change_pct ?? null,
-    open: r.status?.is_open ?? r.status?.open ?? null,
+    // market_status() answers {state: "open"|"closed", note}, not a boolean.
+    open: r.status?.state ? r.status.state === "open" : null,
+    note: r.status?.note ?? null,
   }));
   return NextResponse.json({ ok: true, indices: norm(g.indices), commodities: norm(g.commodities) });
 }

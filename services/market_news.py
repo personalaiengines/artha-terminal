@@ -70,27 +70,37 @@ def _domain(url: str) -> str:
 
 
 def _gather() -> list[dict]:
-    """Run all queries and dedupe by link, then by title."""
+    """Run all queries and dedupe by link, then by title. Also folds in
+    Finnhub general market news (REST poll, additive to the SerpAPI/SearxNG
+    queries above) through the same dedup pass."""
     seen_links: set[str] = set()
     seen_titles: set[str] = set()
     out: list[dict] = []
+
+    def _add(title: str, link: str, snippet: str) -> None:
+        title = (title or "").strip()
+        link = (link or "").strip()
+        if not title:
+            return
+        tkey = title.lower()[:80]
+        if (link and link in seen_links) or tkey in seen_titles:
+            return
+        if link:
+            seen_links.add(link)
+        seen_titles.add(tkey)
+        out.append({"title": title, "link": link, "snippet": (snippet or "").strip()})
+
     for q in _QUERIES:
         for r in _search(q):
-            link = (r.get("link") or "").strip()
-            title = (r.get("title") or "").strip()
-            if not title:
-                continue
-            tkey = title.lower()[:80]
-            if (link and link in seen_links) or tkey in seen_titles:
-                continue
-            if link:
-                seen_links.add(link)
-            seen_titles.add(tkey)
-            out.append({
-                "title": title,
-                "link": link,
-                "snippet": (r.get("snippet") or "").strip(),
-            })
+            _add(r.get("title"), r.get("link"), r.get("snippet"))
+
+    try:
+        from services.finnhub_news import get_finnhub_general_news
+        for r in get_finnhub_general_news():
+            _add(r.get("title"), r.get("link"), r.get("snippet"))
+    except Exception:
+        pass
+
     return out
 
 

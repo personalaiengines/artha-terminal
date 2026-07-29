@@ -1,10 +1,13 @@
 """
 ARTHA Terminal - Fundamentals ETL
-Extracts company financial data from Screener.in.
 
-Sources:
-- Screener.in (SEBI-registered data aggregator)
-- NSE/BSE filings (for verified data)
+Source: yfinance .info, via the same fundamentals_from_info() mapping the live
+per-symbol page uses, so batch and live can't drift apart.
+
+The original screener.in scraper is retained below (_parse_screener_page and
+friends) but is no longer on the ingest path: its ratio-table parse was wrong,
+producing P/E values like -40854 and 74931 with every other field null across
+all 70 rows it ever managed to write.
 """
 
 import requests
@@ -28,77 +31,116 @@ class FundamentalsETL:
     def __init__(self):
         self.base_url = "https://www.screener.in"
         self.session = requests.Session()
-        self.request_delay = 2.0  # Be polite - 2 second delay between requests
+        # 0.6s is the cadence that completed a full 5173-symbol yfinance pass
+        # without tripping Yahoo's IP block; 2.0s made a full run take ~3h.
+        self.request_delay = 0.6
 
     def run(
         self,
         symbols: List[str] | None = None,
-        max_per_run: int = 50,
+        max_per_run: int | None = None,
+        only_missing: bool = False,
     ) -> dict:
         """
-        Run fundamentals ETL.
+        Run fundamentals ETL against yfinance.
+
+        Previously this scraped screener.in and was doubly broken: the parser
+        mis-read the ratio tables (it produced P/E values like -40854 and
+        74931 with every other field null), and it was capped at 50 symbols
+        per weekly run over a hardcoded LIMIT 100 symbol list — so it could
+        never cover the universe even if the parse had been correct.
+
+        yfinance is the same source already trusted for the live per-symbol
+        page, and the mapping is shared with it via fundamentals_from_info().
 
         Args:
-            symbols: Specific symbols to update (None = all tracked)
-            max_per_run: Maximum symbols to process per run
+            symbols: Specific symbols to update (None = all in symbol_master)
+            max_per_run: Optional cap; None means no cap
+            only_missing: Skip symbols that already have a fundamentals row
 
         Returns:
             ETL statistics
         """
-        logger.info("Starting Fundamentals ETL...")
+        logger.info("Starting Fundamentals ETL (yfinance)...")
 
-        stats = {
-            "symbols_processed": 0,
-            "symbols_updated": 0,
-            "errors": 0,
-            "rate_limited": 0,
-        }
+        stats = {"symbols_processed": 0, "symbols_updated": 0, "errors": 0, "no_data": 0}
 
         try:
-            # Get symbols to process
-            if symbols:
-                target_symbols = symbols
-            else:
-                target_symbols = self._get_tracked_symbols()
-
-            # Limit per run to avoid overwhelming sources
-            target_symbols = target_symbols[:max_per_run]
+            target_symbols = symbols or self._get_tracked_symbols(only_missing=only_missing)
+            if max_per_run:
+                target_symbols = target_symbols[:max_per_run]
 
             logger.info(f"Processing {len(target_symbols)} symbols")
 
-            for symbol in target_symbols:
-                result = self._process_symbol(symbol)
+            error_streak = 0
+            for i, symbol in enumerate(target_symbols, 1):
                 stats["symbols_processed"] += 1
-
-                if result["status"] == "success":
-                    stats["symbols_updated"] += 1
-                else:
+                try:
+                    info = self._yfinance_info(symbol, swallow=False)
+                    error_streak = 0
+                except Exception:
                     stats["errors"] += 1
+                    error_streak += 1
+                    # Yahoo blocks this container's IP under sustained load.
+                    # A long run of genuine HTTP errors means we're blocked;
+                    # keep going through mere "no data" symbols, which are
+                    # normal for shells and delisted lines.
+                    if error_streak >= 25:
+                        logger.warning("Aborting: 25 consecutive HTTP errors — likely rate-limited")
+                        break
+                    continue
 
-                # Polite delay
+                # yfinance answers 200 with an essentially empty payload for
+                # shells/delisted lines; treat that as "no data", not an error.
+                if not any(info.get(k) for k in ("trailingPE", "returnOnEquity", "priceToBook", "marketCap")):
+                    stats["no_data"] += 1
+                    continue
+
+                from services.stock_data import fundamentals_from_info
+                self._store_fundamentals(fundamentals_from_info(symbol, info))
+                self._store_market_cap(symbol, info.get("marketCap"))
+                stats["symbols_updated"] += 1
+
+                if i % 100 == 0:
+                    logger.info(f"  {i}/{len(target_symbols)} ({stats['symbols_updated']} updated)")
+
                 time.sleep(self.request_delay)
 
-            logger.info("Fundamentals ETL completed")
+            logger.info(f"Fundamentals ETL completed: {stats}")
             return {"status": "success", **stats}
 
         except Exception as e:
             logger.error(f"Fundamentals ETL failed: {e}")
             return {"status": "error", "error": str(e), **stats}
 
-    def _get_tracked_symbols(self) -> List[str]:
-        """Get list of symbols in database."""
+    def _get_tracked_symbols(self, only_missing: bool = False) -> List[str]:
+        """Symbols to refresh. The old `LIMIT 100` here was the hard ceiling
+        that kept fundamentals at ~1% coverage of a 5000+ symbol universe."""
         try:
+            sql = "SELECT symbol FROM symbol_master WHERE symbol IS NOT NULL"
+            if only_missing:
+                sql += " AND symbol NOT IN (SELECT symbol FROM fundamentals)"
+            sql += " ORDER BY symbol"
             with get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT symbol FROM symbol_master
-                    WHERE symbol IS NOT NULL
-                    LIMIT 100
-                """)
-                return [row["symbol"] for row in cursor.fetchall()]
+                return [row["symbol"] for row in conn.execute(sql).fetchall()]
         except Exception as e:
             logger.error(f"Failed to get tracked symbols: {e}")
             return []
+
+    def _store_market_cap(self, symbol: str, market_cap: float | None) -> None:
+        """symbol_master.market_cap_cr was NULL for 100% of the universe —
+        nothing ever wrote it. yfinance gives it in rupees; the column is crore."""
+        if not market_cap:
+            return
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE symbol_master SET market_cap_cr=?, updated_at=datetime('now') WHERE symbol=?",
+                    (round(float(market_cap) / 1e7, 2), symbol),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"market cap write failed for {symbol}: {e}")
 
     def _process_symbol(self, symbol: str) -> dict:
         """
@@ -188,33 +230,78 @@ class FundamentalsETL:
             logger.error(f"Failed to parse page for {symbol}: {e}")
             return None
 
+    def _yfinance_info(self, symbol: str, swallow: bool = True) -> dict | None:
+        """Single exchange-aware yfinance .info fetch, shared by the sector
+        and company-name backfills so both don't double the network calls
+        for the same symbol.
+
+        BSE-only symbols have no .NS listing — always 404 there — so the
+        suffix must match the symbol's actual exchange (same fix as
+        services/stock_data.py::get_live_stock_data).
+
+        swallow=False lets a real connectivity/HTTP failure propagate instead
+        of collapsing into "call succeeded, this obscure micro-cap just has
+        no data in yfinance at all" — callers that need to tell an actual
+        block apart from genuine sparse coverage (scripts/backfill_sector.py's
+        circuit breaker) need that distinction."""
+        try:
+            import yfinance as yf
+            from db import get_connection
+
+            exchange = "NSE"
+            try:
+                with get_connection() as conn:
+                    row = conn.execute(
+                        "SELECT exchange FROM symbol_master WHERE symbol=?", (symbol,)
+                    ).fetchone()
+                    if row and row["exchange"]:
+                        exchange = row["exchange"]
+            except Exception:
+                pass
+
+            suffix = ".NS" if exchange == "NSE" else ".BO"
+            return yf.Ticker(f"{symbol}{suffix}").info
+        except Exception as e:
+            logger.debug(f"yfinance info fetch failed for {symbol}: {e}")
+            if not swallow:
+                raise
+            return None
+
+    def _yfinance_sector_industry(self, symbol: str, swallow: bool = True) -> tuple[str | None, str | None]:
+        """Screener's breadcrumb scrape is fragile (markup changes, missing
+        breadcrumb) and was returning None for every symbol in production —
+        yfinance's .info is the same sector source already relied on
+        elsewhere in this app (services/stock_data.py) and is reliable."""
+        info = self._yfinance_info(symbol, swallow=swallow) or {}
+        return info.get("sector"), info.get("industry")
+
     def _extract_company_info(self, soup: BeautifulSoup, symbol: str) -> dict:
         """Extract basic company information."""
+        name_elem = soup.find("title")
+        company_name = name_elem.get_text().split("-")[0].strip() if name_elem else symbol
+
+        # Get sector/industry from page
+        # Screener shows structure like: Home > Equity > SECTOR > COMPANY
+        sector = None
+        industry = None
         try:
-            # Company name
-            name_elem = soup.find("title")
-            company_name = name_elem.get_text().split("-")[0].strip() if name_elem else symbol
-
-            # Get sector/industry from page
-            # Screener shows structure like: Home > Equity > SECTOR > COMPANY
             breadcrumb = soup.find("ul", class_="breadcrumb")
-            sector = None
-            industry = None
-
             if breadcrumb:
                 links = breadcrumb.find_all("a")
                 if len(links) >= 3:
                     sector = links[-2].get_text().strip()
                     industry = links[-1].get_text().strip()
-
-            return {
-                "company_name": company_name,
-                "sector": sector,
-                "industry": industry,
-            }
         except Exception as e:
-            logger.debug(f"Failed to extract company info: {e}")
-            return {}
+            logger.debug(f"Screener breadcrumb parse failed for {symbol}: {e}")
+
+        if not sector:
+            sector, industry = self._yfinance_sector_industry(symbol)
+
+        return {
+            "company_name": company_name,
+            "sector": sector,
+            "industry": industry,
+        }
 
     def _extract_ratios(self, soup: BeautifulSoup) -> dict:
         """Extract key financial ratios."""
@@ -422,11 +509,11 @@ class FundamentalsETL:
                      roe, roce, roic, debt_to_equity, current_ratio,
                      sales_cagr_3y, sales_cagr_5y, profit_cagr_3y, profit_cagr_5y,
                      ocf_ttm, pat_ttm, revenue_ttm, book_value, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'screener')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'yfinance')
                     """,
                     (
                         data.get("symbol"),
-                        data.get("date_updated"),
+                        data.get("date_updated") or datetime.now().strftime("%Y-%m-%d"),
                         data.get("pe_ratio"),
                         data.get("pb_ratio"),
                         data.get("dividend_yield"),
@@ -439,9 +526,9 @@ class FundamentalsETL:
                         None,  # sales_cagr_5y
                         None,  # profit_cagr_3y
                         None,  # profit_cagr_5y
-                        data.get("operating_cash_flow"),
-                        data.get("pat"),
-                        data.get("revenue"),
+                        data.get("ocf_ttm"),
+                        data.get("pat_ttm"),
+                        data.get("revenue_ttm"),
                         data.get("book_value"),
                     ),
                 )

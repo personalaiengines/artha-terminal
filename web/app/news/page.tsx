@@ -8,6 +8,7 @@ import { AiBadge } from "@/components/ui/badge";
 import { NewsCard } from "@/components/widgets/news-card";
 import { NewsItem } from "@/lib/data";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 import { timeAgo } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -15,7 +16,7 @@ const CATS = ["All", "Markets", "Macro", "Earnings", "Sector", "Flows", "Corpora
 
 export default function News() {
   const [cat, setCat] = useState("All");
-  const NEWS = useApi<NewsItem[]>("/api/news", [], (j) => j.items);
+  const NEWS = useApi<NewsItem[]>("/api/news", [], (j) => j.items, POLL.news);
   const items = NEWS.filter((n) => cat === "All" || n.category === cat);
   const [featured, ...rest] = items;
 
@@ -25,7 +26,7 @@ export default function News() {
   return (
     <div>
       <PageHeader eyebrow="Intelligence" title="News Intelligence"
-        description="AI-curated market news with credibility scoring, sentiment, and ticker linkage."
+        description="AI-curated market news — each headline carries why it matters and a link to the publisher."
         actions={<LiveDot />} />
 
       <div className="mb-5 flex flex-wrap items-center gap-3">

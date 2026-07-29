@@ -1,67 +1,96 @@
 "use client";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { TrendingUp, TrendingDown, Activity, Gauge, Globe2, ArrowRightLeft } from "lucide-react";
 import { PageHeader } from "@/components/widgets/page-header";
 import { Card, CardHeader, CardBody } from "@/components/ui/card";
-import { DeltaPill } from "@/components/ui/stat";
-import { Sparkline } from "@/components/ui/sparkline";
 import { LiveDot, Avatar } from "@/components/ui/primitives";
 import { Badge } from "@/components/ui/badge";
 import { StockRow } from "@/components/widgets/stock-row";
-import { series, Stock } from "@/lib/data";
+import { IndexStrength } from "@/components/widgets/index-strength";
+import { StaleBadge } from "@/components/widgets/data-health";
+import { MarketBreadth } from "@/components/widgets/market-breadth";
+import { Stock } from "@/lib/data";
 import { moversFrom } from "@/lib/portfolio";
 import { useApi } from "@/lib/use-api";
-import { pct, trendClass, compactCr, inr, signed } from "@/lib/format";
+import { useLivePrices, withLivePrices } from "@/lib/use-live-prices";
+import { POLL } from "@/lib/poll";
+import { pct, changeText, trendClass, compactCr, inr, signed } from "@/lib/format";
+import { useUI } from "@/components/layout/ui-store";
 import { cn } from "@/lib/utils";
 
-// Sector heatmap aggregated from the (live) stock universe.
-function sectors(stocks: Stock[]) {
-  const map = new Map<string, { sum: number; n: number }>();
-  stocks.forEach((s) => { const e = map.get(s.sector) ?? { sum: 0, n: 0 }; e.sum += s.changePct; e.n++; map.set(s.sector, e); });
-  return [...map.entries()].map(([name, { sum, n }]) => ({ name, chg: sum / n, weight: n })).sort((a, b) => b.chg - a.chg);
-}
+type Pulse = {
+  breadth?: { advancing: number; declining: number; total: number; pct: number };
+  sectors?: { name: string; chg: number; count: number }[];
+  universeLabel?: string | null;
+  topGainer?: { symbol: string; chg: number } | null;
+  topLoser?: { symbol: string; chg: number } | null;
+  stale?: boolean; asOf?: string | null;
+};
 
-type Pulse = { breadth?: { advancing: number; declining: number; total: number; pct: number }; sectors?: { name: string; chg: number; count: number }[] };
+type MoverGroup = { gainers: Stock[]; losers: Stock[]; count: number };
+type MoversPayload = { gainers: Stock[]; losers: Stock[]; volume: Stock[]; groups?: Record<string, MoverGroup> };
 
 type Flows = { fiiNet: number | null; diiNet: number | null; fiiStance: string | null; diiStance: string | null; date: string | null };
 type GlobalRow = { name: string; price: number | null; changePct: number | null; unit: string | null };
 
 export default function Markets() {
+  const { changeMode } = useUI();
   const router = useRouter();
-  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items);
-  const pulse = useApi<Pulse | null>("/api/pulse", null, (j) => j);
-  const liveMovers = useApi<{ gainers: Stock[]; losers: Stock[]; volume: Stock[] } | null>("/api/movers", null, (j) => (j.ok ? j : null));
-  const flows = useApi<Flows | null>("/api/flows", null, (j) => (j.ok ? j : null));
-  const globalBoard = useApi<{ indices: GlobalRow[]; commodities: GlobalRow[] } | null>("/api/global", null, (j) => (j.ok ? j : null));
-  const movers = liveMovers ?? moversFrom(universe);
-  const indices = globalBoard?.indices ?? [];
-  const secs = pulse?.sectors?.length
-    ? pulse.sectors.map((s) => ({ name: s.name, chg: s.chg, weight: s.count }))
-    : sectors(universe);
+  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items, POLL.universe);
+  const pulse = useApi<Pulse | null>("/api/pulse", null, (j) => j, POLL.pulse);
+  const liveMovers = useApi<MoversPayload | null>("/api/movers", null, (j) => (j.ok ? j : null), POLL.movers);
+  const flows = useApi<Flows | null>("/api/flows", null, (j) => (j.ok ? j : null), POLL.flows);
+  const globalBoard = useApi<{ indices: GlobalRow[]; commodities: GlobalRow[] } | null>("/api/global", null, (j) => (j.ok ? j : null), POLL.globalBoard);
+  const moversAll = liveMovers ?? moversFrom(universe);
+
+  // Same index/sector slicing as the dashboard, from the same payload.
+  const [scope, setScope] = useState("Market");
+  const groups = liveMovers?.groups ?? {};
+  const scopes = ["Market", ...Object.keys(groups)];
+  const scopeCount = groups[scope]?.count ?? 0;
+  const scopedRaw = scope === "Market" ? moversAll : (groups[scope] ?? { gainers: [], losers: [] });
+
+  // Live ticks for every row this page renders.
+  const live = useLivePrices([
+    ...scopedRaw.gainers.slice(0, 8).map((s) => s.symbol),
+    ...scopedRaw.losers.slice(0, 8).map((s) => s.symbol),
+    ...(moversAll.volume ?? []).slice(0, 8).map((s) => s.symbol),
+  ]);
+  const movers = {
+    gainers: withLivePrices(scopedRaw.gainers, live),
+    losers: withLivePrices(scopedRaw.losers, live),
+    volume: withLivePrices(moversAll.volume ?? [], live),
+  };
+  // Always the API's sectors — including the last known-good snapshot when
+  // the upstream is down. Recomputing them here from `universe` produced a
+  // different vocabulary over a different universe, so the heatmap silently
+  // changed shape whenever a feed hiccuped.
+  const secs = (pulse?.sectors ?? []).map((s) => ({ name: s.name, chg: s.chg, weight: s.count }));
+  const pulseStale = !!pulse?.stale;
   return (
     <div>
       <PageHeader eyebrow="Live · NSE / BSE" title="Market Overview"
         description="Indices, breadth, sector rotation and the day's movers — one live tape."
         actions={<LiveDot />} />
 
-      {/* Indices — real global board */}
-      {indices.length > 0 && (
-        <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-          {indices.slice(0, 6).map((idx, i) => (
-            <Card key={idx.name} delay={i * 0.04} interactive className="p-4">
-              <div className="flex items-center justify-between"><span className="text-[11px] font-semibold uppercase tracking-wide text-muted">{idx.name}</span><DeltaPill pct={idx.changePct ?? 0} /></div>
-              <div className="mt-1.5 text-[18px] font-semibold text-frost tnum">{idx.price != null ? idx.price.toLocaleString("en-IN") : "—"}</div>
-              <Sparkline data={series(idx.name.charCodeAt(0) + idx.name.length, 40, idx.price || 100, 0.006)} width={180} height={30} positive={(idx.changePct ?? 0) >= 0} />
-            </Card>
-          ))}
-        </div>
-      )}
+      {/* This slot held a grid of Indian index cards, which duplicated the
+          topbar tape shown on every page. Relative strength answers something
+          neither the tape nor any other panel does: which index is leading. */}
+      <IndexStrength />
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
         {/* Sector heatmap */}
         <Card className="xl:col-span-2">
-          <CardHeader icon={<Gauge size={16} />} title="Sector Rotation" subtitle="Average performance by sector today" />
+          <CardHeader icon={<Gauge size={16} />} title="Sector Rotation"
+            subtitle="Average performance by sector today — click a sector to screen it"
+            action={pulseStale ? <StaleBadge asOf={pulse?.asOf ?? null} /> : null} />
           <CardBody>
+            {secs.length === 0 && (
+              <p className="py-8 text-center text-[13px] text-muted">
+                No sector data has ever been fetched successfully — nothing to show yet.
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
               {secs.map((s) => {
                 const intensity = Math.min(1, Math.abs(s.chg) / 3);
@@ -69,47 +98,67 @@ export default function Markets() {
                   ? `color-mix(in oklab, var(--color-up) ${18 + intensity * 40}%, var(--color-elevated))`
                   : `color-mix(in oklab, var(--color-down) ${18 + intensity * 40}%, var(--color-elevated))`;
                 return (
-                  <div key={s.name} className="rounded-[var(--radius-md)] p-3 hairline" style={{ background: bg }}>
+                  <button
+                    key={s.name}
+                    type="button"
+                    onClick={() => router.push(`/stocks?sector=${encodeURIComponent(s.name)}`)}
+                    aria-label={`Screen ${s.name} stocks`}
+                    className="rounded-[var(--radius-md)] p-3 text-left hairline transition-transform hover:scale-[1.02] ring-focus"
+                    style={{ background: bg }}
+                  >
                     <div className="text-[12px] font-semibold text-frost truncate">{s.name}</div>
                     <div className={cn("mt-1 text-[16px] font-bold tnum", trendClass(s.chg))}>{pct(s.chg)}</div>
                     <div className="text-[10px] text-muted">{s.weight} stocks</div>
-                  </div>
+                  </button>
                 );
               })}
             </div>
           </CardBody>
         </Card>
 
-        {/* Breadth */}
-        <Card>
-          <CardHeader icon={<Activity size={16} />} title="Market Breadth" />
-          <CardBody className="space-y-4">
-            {(() => {
-              const b = pulse?.breadth;
-              const adv = b?.advancing ?? 0, dec = b?.declining ?? 0;
-              const tot = b?.total ?? 0, unch = Math.max(0, tot - adv - dec);
-              const ratio = dec ? (adv / dec) : 0;
-              const rows: [string, number, string][] = [["Advances", adv, "up"], ["Declines", dec, "down"], ["Unchanged", unch, "neutral"]];
-              return <>
-                {rows.map(([k, v, t]) => (
-                  <div key={k}>
-                    <div className="mb-1 flex justify-between text-[12px]"><span className="text-muted">{k}</span><span className="font-semibold text-frost tnum">{v.toLocaleString("en-IN")}</span></div>
-                    <div className="h-1.5 rounded-full bg-line overflow-hidden"><div className={cn("h-full rounded-full", t === "up" ? "bg-up" : t === "down" ? "bg-down" : "bg-muted")} style={{ width: `${v / (tot || 1) * 100}%` }} /></div>
-                  </div>
-                ))}
-                <div className="rounded-[var(--radius-md)] bg-void/40 p-3 hairline">
-                  <div className="flex items-center justify-between text-[12px]"><span className="text-muted">Adv/Dec Ratio</span><span className={cn("font-bold tnum", ratio >= 1 ? "text-up" : "text-down")}>{ratio.toFixed(2)}</span></div>
-                </div>
-              </>;
-            })()}
-          </CardBody>
-        </Card>
+        <MarketBreadth
+          breadth={pulse?.breadth}
+          sectors={secs}
+          universeLabel={pulse?.universeLabel}
+          topGainer={pulse?.topGainer}
+          topLoser={pulse?.topLoser}
+          stale={pulseStale}
+          asOf={pulse?.asOf}
+        />
       </div>
 
-      {/* Movers */}
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card><CardHeader icon={<TrendingUp size={16} className="text-up" />} title="Top Gainers" /><CardBody className="space-y-0.5">{movers.gainers.map((s) => <StockRow key={s.symbol} stock={s} spark={false} />)}</CardBody></Card>
-        <Card><CardHeader icon={<TrendingDown size={16} className="text-down" />} title="Top Losers" /><CardBody className="space-y-0.5">{movers.losers.map((s) => <StockRow key={s.symbol} stock={s} spark={false} />)}</CardBody></Card>
+      {/* Movers, sliced by index / sector — same chips as the dashboard */}
+      <div className="mt-6 flex gap-1 overflow-x-auto pb-1">
+        {scopes.map((g) => (
+          <button key={g} onClick={() => setScope(g)}
+            className={cn(
+              "shrink-0 rounded-full px-2.5 py-1 text-[11.5px] font-medium transition-colors",
+              g === scope ? "bg-accent/15 text-accent" : "text-muted hover:bg-raised hover:text-frost"
+            )}>
+            {g}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-3 grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <Card>
+          <CardHeader icon={<TrendingUp size={16} className="text-up" />} title="Top Gainers"
+            subtitle={scope === "Market" ? "Market-wide" : `${scope} · ${scopeCount} stocks`} />
+          <CardBody className="space-y-0.5">
+            {movers.gainers.length > 0
+              ? movers.gainers.map((s) => <StockRow key={s.symbol} stock={s} spark={false} />)
+              : <p className="px-2.5 py-2 text-[12px] text-muted">Nothing up in {scope} today.</p>}
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader icon={<TrendingDown size={16} className="text-down" />} title="Top Losers"
+            subtitle={scope === "Market" ? "Market-wide" : `${scope} · ${scopeCount} stocks`} />
+          <CardBody className="space-y-0.5">
+            {movers.losers.length > 0
+              ? movers.losers.map((s) => <StockRow key={s.symbol} stock={s} spark={false} />)
+              : <p className="px-2.5 py-2 text-[12px] text-muted">Nothing down in {scope} today.</p>}
+          </CardBody>
+        </Card>
         <Card>
           <CardHeader icon={<Activity size={16} />} title="Most Active" subtitle="By volume" />
           <CardBody className="space-y-1">
@@ -117,7 +166,7 @@ export default function Markets() {
               <div key={s.symbol} onClick={() => router.push(`/stocks/${s.symbol}`)} className="flex cursor-pointer items-center gap-3 rounded-[var(--radius-sm)] px-2.5 py-2 hover:bg-raised/60">
                 <Avatar symbol={s.symbol} size={30} />
                 <div><div className="text-[13px] font-semibold text-frost">{s.symbol}</div><div className="text-[11px] text-muted tnum">{compactCr(s.volume)} vol</div></div>
-                <div className="ml-auto text-right"><div className="text-[13px] font-semibold text-frost tnum">{inr(s.price)}</div><div className={cn("text-[11px] tnum", trendClass(s.changePct))}>{pct(s.changePct)}</div></div>
+                <div className="ml-auto text-right"><div className="text-[13px] font-semibold text-frost tnum">{inr(s.price)}</div><div className={cn("text-[11px] tnum", trendClass(s.changePct))}>{changeText(s.changePct, s.change, changeMode)}</div></div>
               </div>
             ))}
           </CardBody>
@@ -144,16 +193,30 @@ export default function Markets() {
 
         <Card className="lg:col-span-2">
           <CardHeader icon={<Globe2 size={16} />} title="Global Markets" subtitle="World indices & commodities" action={globalBoard ? <LiveDot /> : null} />
-          <CardBody>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-              {[...(globalBoard?.indices ?? []), ...(globalBoard?.commodities ?? [])].slice(0, 8).map((g) => (
-                <div key={g.name} className="rounded-[var(--radius-md)] bg-void/40 p-3 hairline">
-                  <div className="text-[11px] font-medium text-muted truncate">{g.name}</div>
-                  <div className="mt-1 text-[14px] font-semibold text-frost tnum">{g.price != null ? g.price.toLocaleString("en-IN") : "—"}</div>
-                  <div className={cn("text-[11px] tnum", trendClass(g.changePct ?? 0))}>{g.changePct != null ? pct(g.changePct) : "—"}</div>
+          <CardBody className="space-y-4">
+            {/* Two labelled groups. A single flat list truncated to 8 tiles hid
+                the commodities entirely, since the index list is already 8 long. */}
+            {([["Indices", globalBoard?.indices], ["Commodities", globalBoard?.commodities]] as const).map(
+              ([label, rows]) => (rows?.length ? (
+                <div key={label}>
+                  <div className="mb-1.5 text-[11px] uppercase tracking-wide text-faint">{label}</div>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+                    {rows.map((g) => {
+                      const abs = g.price != null && g.changePct != null ? (g.price * g.changePct) / 100 : null;
+                      return (
+                        <div key={g.name} className="rounded-[var(--radius-md)] bg-void/40 p-3 hairline">
+                          <div className="text-[11px] font-medium text-muted truncate">{g.name}</div>
+                          <div className="mt-1 text-[14px] font-semibold text-frost tnum">
+                            {g.price != null ? `${g.unit ?? ""}${g.price.toLocaleString("en-IN")}` : "—"}
+                          </div>
+                          <div className={cn("text-[11px] tnum", trendClass(g.changePct ?? 0))}>{g.changePct != null ? changeText(g.changePct, abs, changeMode) : "—"}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-              ))}
-            </div>
+              ) : null)
+            )}
           </CardBody>
         </Card>
       </div>

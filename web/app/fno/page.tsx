@@ -11,11 +11,12 @@ import { CandleChart } from "@/components/ui/candles";
 import { OptionChain } from "@/components/widgets/option-chain";
 import { FnoNarrative } from "@/components/widgets/fno-narrative";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 import { compactCr } from "@/lib/format";
-import { candles } from "@/lib/data";
 
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"];
 
+type Candle = { t: string; open: number; high: number; low: number; close: number; volume: number };
 type OCRow = { strike: number; call: { oi: number; oiChg: number; vol: number; iv: number; ltp: number }; put: { oi: number; oiChg: number; vol: number; iv: number; ltp: number } };
 type Plan = {
   ok: boolean; spot: number; atm: number; pcr: number; maxPain: number; iv: number; vix: number | null;
@@ -27,7 +28,8 @@ const KIND_COLOR: Record<string, string> = { resistance: "#f4586a", support: "#1
 
 export default function FnO() {
   const [idx, setIdx] = useState("NIFTY");
-  const live = useApi<Plan | null>(`/api/fno/${idx}`, null, (j) => (j.ok ? j : null));
+  const live = useApi<Plan | null>(`/api/fno/${idx}`, null, (j) => (j.ok ? j : null), POLL.fno);
+  const indexCandles = useApi<Candle[]>(`/api/history?symbols=${idx}&days=90&ohlc=1`, [], (j) => j.candles ?? [], POLL.history);
 
   const header = (
     <PageHeader eyebrow="Derivatives" title="F&O Analysis"
@@ -50,10 +52,10 @@ export default function FnO() {
   const totalPutOI = rows.reduce((a, r) => a + r.put.oi, 0);
   const levels = live.levels.map((l) => ({ price: Math.round(l.price), label: l.label, color: KIND_COLOR[l.kind] ?? "#f5a623" }));
   const oiData = rows.map((r) => ({ name: String(r.strike), value: r.put.oi - r.call.oi }));
-  // No per-index intraday OHLC feed is served yet — render deterministic candle
-  // geometry seeded on the LIVE spot so the chart shows candlesticks (not just
-  // level lines), with the real call/put walls & max-pain overlaid.
-  const chartBars = spot ? candles(idx.length + Math.round(spot), 90, spot) : [];
+  // Real daily index OHLC (ingestion/index_history.py -> prices_daily).
+  // Was deterministic geometry seeded on the spot price: it looked like a
+  // chart but encoded no actual market history.
+  const chartBars = indexCandles;
 
   return (
     <div>

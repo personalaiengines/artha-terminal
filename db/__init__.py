@@ -85,6 +85,61 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
 
+    # SQLite can't ALTER a CHECK constraint in place — rebuild the table (the
+    # standard SQLite recipe: rename, recreate, copy, drop) only if the new
+    # value isn't already accepted, so this is a no-op on every later startup.
+    _add_check_value(conn, "agent_cache", "market_news",
+        """CREATE TABLE agent_cache (
+            key TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL REFERENCES symbol_master(symbol),
+            analysis_type TEXT CHECK(analysis_type IN
+                ('deep_dive', 'swot', 'verdict', 'sector_outlook', 'red_flags', 'market_news')) NOT NULL,
+            content_json TEXT NOT NULL,
+            model_used TEXT,
+            tokens_used INTEGER,
+            cache_at TEXT NOT NULL,
+            ttl_hours INTEGER DEFAULT 6,
+            expires_at TEXT NOT NULL,
+            prompt_hash TEXT,
+            tool_calls JSON,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""",
+        ["CREATE INDEX IF NOT EXISTS idx_agent_cache_expires ON agent_cache(expires_at)"])
+
+    _add_check_value(conn, "search_cache", "finnhub",
+        """CREATE TABLE search_cache (
+            key TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            sector TEXT,
+            symbol TEXT,
+            results_json TEXT NOT NULL,
+            source TEXT CHECK(source IN ('serpapi', 'searxng', 'jina', 'finnhub')) NOT NULL,
+            cache_at TEXT NOT NULL,
+            ttl_hours INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""",
+        ["CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache(expires_at)"])
+
+
+def _add_check_value(conn: sqlite3.Connection, table: str, value: str,
+                      create_sql: str, index_sql: list[str]) -> None:
+    """Rebuild `table` with a CHECK constraint that additionally allows
+    `value`, unless it already does. `create_sql` is the full new CREATE
+    TABLE statement (with the widened CHECK already baked in)."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not row or not row[0] or value in row[0]:
+        return  # table missing (fresh schema.sql already has it) or already migrated
+    conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+    conn.execute(create_sql)
+    conn.execute(f"INSERT INTO {table} SELECT * FROM {table}_old")
+    conn.execute(f"DROP TABLE {table}_old")
+    for stmt in index_sql:
+        conn.execute(stmt)
+    print(f"[OK] Migration: {table} CHECK constraint now allows '{value}'")
+
 
 @contextmanager
 def get_connection(db_path: Path = None):

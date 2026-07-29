@@ -108,8 +108,30 @@ class AgentOrchestrator:
         result["analysis_type"] = analysis_type
         result["cached"] = False
 
-        # Cache the result
-        if use_cache:
+        # Debate layer: Bull/Bear/Judge narrative over the deterministic
+        # findings the tool loop above already computed (no re-fetching).
+        # Gated to the analysis types worth the extra 3 LLM calls; skipped
+        # entirely for quick queries to avoid tripling free-tier usage.
+        if analysis_type in ("deep_dive", "verdict"):
+            try:
+                from agent.debate import extract_quant, run_debate
+                quant = extract_quant(result.get("tool_calls") or [])
+                debate = await run_debate(symbol, quant, result.get("content") or "")
+                if debate:
+                    result["debate"] = debate
+                    result["content"] = (
+                        (result.get("content") or "")
+                        + f"\n\n---\n**Debate Verdict** (Bull/Bear reviewed):\n{debate['verdict_text']}"
+                    )
+            except Exception as e:
+                logger.warning(f"Debate layer failed for {symbol}: {e}")
+
+        # Cache the result — but never an empty answer. Free-tier models
+        # occasionally return no tool_calls AND empty content (treated as
+        # "done" by the loop above); caching that would lock the symbol into
+        # a blank answer for the full 6h TTL, surviving even a later retry
+        # that would have succeeded.
+        if use_cache and result.get("content"):
             self._set_cached(cache_key, symbol, analysis_type, result)
 
         return result
@@ -138,7 +160,7 @@ class AgentOrchestrator:
         try:
             for iteration in range(max_iterations):
                 # Call the LLM
-                response = await self.router.chat(conversation, tools=tool_schemas)
+                response = await self.router.chat(conversation, tools=tool_schemas, task_shape="deep")
 
                 if not model_used:
                     model_used = response.get("model", "unknown")

@@ -28,7 +28,10 @@ export function Badge({
 const RATING_TONE: Record<string, Tone> = {
   "Strong Buy": "up", Buy: "up", Hold: "warn", Reduce: "down", Sell: "down",
 };
-export function RatingBadge({ rating }: { rating: string }) {
+export function RatingBadge({ rating }: { rating: string | null | undefined }) {
+  // No score computed for this symbol -> no rating. Render a muted dash rather
+  // than an empty badge, so "unrated" is visibly different from "rated Hold".
+  if (!rating) return <span className="text-faint">—</span>;
   return (
     <Badge tone={RATING_TONE[rating] ?? "neutral"} className="lowercase">
       <span className="capitalize">{rating}</span>

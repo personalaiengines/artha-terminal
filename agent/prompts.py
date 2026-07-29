@@ -38,7 +38,10 @@ ARTHA Terminal is a research/education tool under SEBI guidelines. The Analysis 
 DEEP_DIVE_PROMPT = """Perform a comprehensive deep-dive analysis of {symbol}.
 
 You have access to the following tools:
-- get_price_history: OHLCV, DMAs, ATH/ATL, percentiles
+- get_price_history: OHLCV, DMAs, ATH/ATL, percentiles. Its `data` array is
+  ordered oldest-to-newest — for "Latest Close" / "as of" claims, use the
+  top-level `latest_close`/`latest_date` fields directly, never the first
+  row of `data`.
 - get_fundamentals: ratios, CAGRs, cash flow
 - get_shareholding: 8Q ownership series + QoQ deltas
 - resolve_peers: top-N same-industry peers by market cap

@@ -7,14 +7,15 @@ import { useUI } from "./ui-store";
 import { NAV } from "@/lib/nav";
 import { Stock } from "@/lib/data";
 import { useApi } from "@/lib/use-api";
-import { pct, trendClass } from "@/lib/format";
+import { POLL } from "@/lib/poll";
+import { changeText, trendClass } from "@/lib/format";
 import { Avatar } from "@/components/ui/primitives";
 import { cn } from "@/lib/utils";
 
 export function CommandPalette() {
-  const { cmdkOpen, setCmdk } = useUI();
+  const { cmdkOpen, setCmdk, changeMode } = useUI();
   const router = useRouter();
-  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items);
+  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items, POLL.universe);
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
 
@@ -92,7 +93,7 @@ export function CommandPalette() {
                   {r.type === "stock" && (
                     <><Avatar symbol={r.x.symbol} size={32} />
                       <div className="min-w-0"><div className="text-[13px] font-medium text-frost">{r.x.symbol}</div><div className="text-[11px] text-muted truncate">{r.x.name}</div></div>
-                      <span className={cn("ml-auto text-[12px] font-medium tnum", trendClass(r.x.changePct))}>{pct(r.x.changePct)}</span></>
+                      <span className={cn("ml-auto text-[12px] font-medium tnum", trendClass(r.x.changePct))}>{changeText(r.x.changePct, r.x.change, changeMode)}</span></>
                   )}
                   {r.type === "page" && (
                     <><span className="flex h-8 w-8 items-center justify-center rounded-[8px] bg-elevated text-muted hairline"><r.n.icon size={16} /></span>

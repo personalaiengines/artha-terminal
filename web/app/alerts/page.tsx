@@ -7,7 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Segmented, Avatar, EmptyState, LiveDot } from "@/components/ui/primitives";
 import { Alert, Stock } from "@/lib/data";
+import { DataHealthCard } from "@/components/widgets/data-health";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 import { timeAgo, timeUntil } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -76,7 +78,7 @@ function IngestionMonitor() {
 }
 
 export default function Alerts() {
-  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items);
+  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items, POLL.universe);
   const [filter, setFilter] = useState("all");
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [live, setLive] = useState(false);
@@ -118,6 +120,7 @@ export default function Alerts() {
         description="Price, volume, technical, AI-rating and news triggers — saved and monitored."
         actions={<>{live && <LiveDot />}<Button variant="primary" size="sm" onClick={() => setOpen((v) => !v)}><Plus size={14} />New Alert</Button></>} />
 
+      <DataHealthCard />
       <IngestionMonitor />
 
       {/* Create form */}

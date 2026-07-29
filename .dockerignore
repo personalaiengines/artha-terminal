@@ -79,8 +79,10 @@ docs/
 
 # ARTHA specific — the api image needs none of these
 screener_cookies.json
-web/            # Next.js app (its own image) — node_modules/.next are huge
-archive/        # retired Streamlit app
+# Next.js app has its own image; node_modules/.next are huge
+web/
+# retired Streamlit app
+archive/
 tests/
 fixtures/
 node_modules/

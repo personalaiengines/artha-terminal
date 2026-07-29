@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS computed_metrics (
 CREATE TABLE IF NOT EXISTS agent_cache (
     key TEXT PRIMARY KEY,
     symbol TEXT NOT NULL REFERENCES symbol_master(symbol),
-    analysis_type TEXT CHECK(analysis_type IN ('deep_dive', 'swot', 'verdict', 'sector_outlook', 'red_flags')) NOT NULL,
+    analysis_type TEXT CHECK(analysis_type IN ('deep_dive', 'swot', 'verdict', 'sector_outlook', 'red_flags', 'market_news')) NOT NULL,
     content_json TEXT NOT NULL,  -- Serialized LLM output
     model_used TEXT,
     tokens_used INTEGER,
@@ -225,7 +225,7 @@ CREATE TABLE IF NOT EXISTS search_cache (
     sector TEXT,
     symbol TEXT,
     results_json TEXT NOT NULL,
-    source TEXT CHECK(source IN ('serpapi', 'searxng', 'jina')) NOT NULL,
+    source TEXT CHECK(source IN ('serpapi', 'searxng', 'jina', 'finnhub')) NOT NULL,
     cache_at TEXT NOT NULL,
     ttl_hours INTEGER NOT NULL,
     expires_at TEXT NOT NULL,
@@ -249,6 +249,31 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ingestion_runs_job_started ON ingestion_runs(job_id, started_at DESC);
+
+-- Last known-good payload per feed, so a failed upstream serves real (dated)
+-- data instead of nothing. Survives restarts, which the in-process TTL cache
+-- does not — a cold start after a container restart was the one case where a
+-- transient upstream failure left a panel with no data at all.
+CREATE TABLE IF NOT EXISTS last_good (
+    key          TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    saved_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Index membership (NIFTY 50, Bank Nifty, sector indices …), ingested from the
+-- official NSE constituent CSVs. Previously these lists were literals in
+-- services/nifty50.py, which drifted the moment NSE rejigged an index — the
+-- hardcoded Bank Nifty was already missing UNIONBANK and YESBANK.
+-- `industry` is NSE's own sector label for the stock, from the same CSV.
+CREATE TABLE IF NOT EXISTS index_members (
+    index_key   TEXT NOT NULL,
+    index_name  TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    industry    TEXT,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (index_key, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_index_members_symbol ON index_members(symbol);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

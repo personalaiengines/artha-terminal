@@ -10,22 +10,48 @@ import { Stat, DeltaPill, ScoreRing, HealthBar } from "@/components/ui/stat";
 import { Segmented, Avatar, EmptyState } from "@/components/ui/primitives";
 import { AreaPrice, Donut, HBars } from "@/components/ui/chart";
 import { DataGrid, Column } from "@/components/ui/data-grid";
-import { portfolioSummary, sectorAllocation, RawHolding } from "@/lib/portfolio";
+import { portfolioSummary, sectorAllocation, portfolioQuality, RawHolding } from "@/lib/portfolio";
 import { series, Stock } from "@/lib/data";
 import { useApi } from "@/lib/use-api";
+import { useLivePrices, withLivePrices } from "@/lib/use-live-prices";
+import { POLL } from "@/lib/poll";
+import { useEnsureFresh } from "@/lib/use-fresh";
 import { inr, compactCr, trendClass, signed } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const authorize = () => window.dispatchEvent(new Event("artha:authorize"));
 
+// Green = healthy, amber = watch, red = concerning. Concentration is inverted
+// relative to the others: "High" concentration is a risk, "Low" is healthy,
+// whereas "High" quality and "Good" diversification are the desirable ends.
+const VERDICT_TONE = (label: string, verdict: string | null | undefined) => {
+  if (!verdict) return "bg-muted";
+  const good = label === "Concentration" ? "Low" : verdict === "Good" ? "Good" : "High";
+  const bad = label === "Concentration" ? "High" : "Low";
+  return verdict === good ? "bg-up" : verdict === bad ? "bg-down" : "bg-warn";
+};
+
 export default function Portfolio() {
   const router = useRouter();
-  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items);
-  const holdings = useApi<RawHolding[]>("/api/holdings", [], (j) => j.items ?? []);
+  const universeRaw = useApi<Stock[]>("/api/universe", [], (j) => j.items, POLL.universe);
+  const holdings = useApi<RawHolding[]>("/api/holdings", [], (j) => j.items ?? [], POLL.holdings);
+  // Your own book first: every held symbol streams, so P&L moves with the market.
+  const live = useLivePrices(holdings.map((h) => h.symbol));
+  const universe = withLivePrices(universeRaw, live);
   const pf = portfolioSummary(holdings, universe);
   const alloc = sectorAllocation(holdings, universe);
+  const quality = portfolioQuality(holdings, universe);
+  useEnsureFresh(holdings.map((h) => h.symbol));
   const [range, setRange] = useState("6M");
-  const curve = series(99, 60, pf.invested || 1, 0.012).map((v, i) => ({ t: i, v }));
+  // Real portfolio value history: each holding's qty x that day's actual close.
+  // Was series(99, 60, invested) — a random walk seeded with the constant 99,
+  // so the "performance" chart was identical for every portfolio and never
+  // reflected a single real trade.
+  const curveApi = useApi<{ points: { t: string; v: number }[]; metrics: any; covered: number; total: number }>(
+    "/api/portfolio/curve", { points: [], metrics: {}, covered: 0, total: 0 }, (j) => j, POLL.curve
+  );
+  const RANGE_DAYS: Record<string, number> = { "1M": 22, "3M": 66, "6M": 126, "1Y": 252, ALL: 10000 };
+  const curve = curveApi.points.slice(-(RANGE_DAYS[range] ?? 126));
 
   const header = (
     <PageHeader eyebrow="Wealth" title="Portfolio Analytics"
@@ -51,7 +77,7 @@ export default function Portfolio() {
     { key: "cur", header: "Value", align: "right", sortable: true, sortValue: (r) => r.current, cell: (r) => <span className="tnum font-medium">₹{compactCr(r.current)}</span> },
     { key: "day", header: "Day P&L", align: "right", sortable: true, sortValue: (r) => r.dayPnl, cell: (r) => <span className={cn("tnum", trendClass(r.dayPnl))}>{signed(r.dayPnl, 0)}</span> },
     { key: "pnl", header: "Overall P&L", align: "right", sortable: true, sortValue: (r) => r.pnl, cell: (r) => <span className={cn("tnum font-medium", trendClass(r.pnl))}>{signed(r.pnl, 0)}</span> },
-    { key: "pct", header: "Return", align: "right", sortable: true, sortValue: (r) => r.pnlPct, cell: (r) => <DeltaPill pct={r.pnlPct} /> },
+    { key: "pct", header: "Return", align: "right", sortable: true, sortValue: (r) => r.pnlPct, cell: (r) => <DeltaPill value={r.pnl} pct={r.pnlPct} /> },
     { key: "health", header: "Health", align: "right", cell: (r) => <span className="inline-flex w-16 items-center gap-2"><HealthBar value={r.stock.health} /></span> },
   ];
 
@@ -71,7 +97,20 @@ export default function Portfolio() {
               <Stat label="Day P&L" value={pf.dayPnl} prefix="₹" decimals={0} delta={pf.dayPnlPct} />
               <Stat label="Overall P&L" value={pf.pnl} prefix="₹" decimals={0} delta={pf.pnlPct} />
             </div>
-            <AreaPrice data={curve} dataKey="v" xKey="t" up={pf.pnl >= 0} height={200} showAxes={false} valueFmt={(v) => "₹" + compactCr(v)} />
+            {curve.length >= 2 ? (
+              <>
+                <AreaPrice data={curve} dataKey="v" xKey="t" up={pf.pnl >= 0} height={200} showAxes={false} valueFmt={(v) => "₹" + compactCr(v)} />
+                {curveApi.covered < curveApi.total && (
+                  <p className="mt-2 text-[11px] text-muted">
+                    Curve covers {curveApi.covered} of {curveApi.total} holdings — the rest have no price history yet.
+                  </p>
+                )}
+              </>
+            ) : (
+              <div className="flex h-[200px] items-center justify-center text-[13px] text-muted">
+                No price history for these holdings yet — performance chart unavailable.
+              </div>
+            )}
           </CardBody>
         </Card>
 
@@ -99,11 +138,19 @@ export default function Portfolio() {
           <Card variant="ai">
             <CardHeader icon={<Sparkles size={16} className="text-ai" />} title="Portfolio Health" subtitle="AI-weighted across holdings" />
             <CardBody className="flex items-center gap-5">
-              <ScoreRing value={pf.health / 10} size={84} label="Score" />
+              <ScoreRing value={pf.health == null ? null : pf.health / 10} size={84} label="Score" />
               <div className="space-y-2 text-[12.5px]">
-                <div className="flex items-center gap-2"><span className="h-2 w-2 rounded-full bg-up" /><span className="text-muted">Diversification</span><span className="ml-auto font-semibold text-frost">Good</span></div>
-                <div className="flex items-center gap-2"><span className="h-2 w-2 rounded-full bg-warn" /><span className="text-muted">Concentration</span><span className="ml-auto font-semibold text-frost">Moderate</span></div>
-                <div className="flex items-center gap-2"><span className="h-2 w-2 rounded-full bg-up" /><span className="text-muted">Quality</span><span className="ml-auto font-semibold text-frost">High</span></div>
+                {([
+                  ["Diversification", quality?.diversification, quality && `${quality.holdingCount} holdings · ${quality.sectorCount} sectors`],
+                  ["Concentration", quality?.concentration, quality && `top position ${quality.topWeight.toFixed(0)}%`],
+                  ["Quality", quality?.quality, "value-weighted health"],
+                ] as const).map(([label, verdict, hint]) => (
+                  <div key={label} className="flex items-center gap-2" title={hint || undefined}>
+                    <span className={cn("h-2 w-2 rounded-full", VERDICT_TONE(label, verdict))} />
+                    <span className="text-muted">{label}</span>
+                    <span className="ml-auto font-semibold text-frost">{verdict ?? "—"}</span>
+                  </div>
+                ))}
               </div>
             </CardBody>
           </Card>

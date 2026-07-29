@@ -84,6 +84,13 @@ formatters ([`lib/format.ts`](lib/format.ts)) and numeric UI primitives
 
 `ARTHA_API_URL` points at the API (`http://api:8000` in Docker, `http://localhost:8000` in dev).
 
+`NEXT_PUBLIC_ARTHA_WS_URL` (browser-visible) points the live-tick WebSocket client
+([`lib/use-ws.ts`](lib/use-ws.ts)) at the API's `/ws` endpoint. Defaults to
+`ws://<current-hostname>:8000/ws` if unset, which covers plain `npm run dev` and any
+host reachable on port 8000 without configuration. Note: `NEXT_PUBLIC_*` vars are inlined
+at `next build` time — a Docker deployment on a different API host needs this passed as a
+build arg, not just a container `environment:` entry.
+
 ## Deliberate scope cuts (v1)
 
 - **No TanStack Table / React Query / Zustand.** Rows are static mock data, so a

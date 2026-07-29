@@ -26,6 +26,9 @@ function Callback() {
       .then((r) => {
         if (r?.ok) {
           setState("ok"); setMessage("Upstox authorized — live data is back online.");
+          // Pull every hook forward so the dashboard we bounce to isn't still
+          // rendering the pre-authorization state.
+          window.dispatchEvent(new Event("artha:refresh"));
           setTimeout(() => router.push("/"), 1800);
         } else {
           setState("error"); setMessage(r?.message ?? "Upstox rejected the code.");

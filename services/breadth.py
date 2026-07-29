@@ -62,7 +62,8 @@ def _nifty50_changes() -> list[dict]:
     Returns [] on failure so the caller can fall back to the DB universe.
     """
     import logging
-    from services.nifty50 import NIFTY50
+    from services.constituents import nifty50_sectors
+    sectors = nifty50_sectors()
     try:
         import yfinance as yf
     except Exception:
@@ -72,7 +73,7 @@ def _nifty50_changes() -> list[dict]:
     # can't price (e.g. LTIM); we drop those gracefully, so silence the noise.
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-    syms = list(NIFTY50.keys())
+    syms = list(sectors)
     tickers = [f"{s}.NS" for s in syms]
     try:
         df = yf.download(tickers, period="5d", interval="1d", group_by="ticker",
@@ -88,7 +89,7 @@ def _nifty50_changes() -> list[dict]:
             closes = df[f"{s}.NS"]["Close"].dropna()
             if len(closes) >= 2:
                 chg = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100.0
-                out.append({"symbol": s, "sector": NIFTY50[s], "chg": round(float(chg), 2)})
+                out.append({"symbol": s, "sector": sectors[s], "chg": round(float(chg), 2)})
         except Exception:
             continue
     return out
@@ -119,6 +120,47 @@ def _stock_changes() -> list[dict]:
                  "chg": round(r["chg"], 2)}
                 for r in cur.fetchall()
             ]
+    except Exception:
+        return []
+
+
+def _sector_changes() -> list[dict]:
+    """Per-stock day change for every INDEXED stock, labelled with NSE industry.
+
+    Sector rotation gets its own deterministic source, separate from breadth.
+    Breadth flips between a live yfinance NIFTY-50 pass and the whole DB
+    universe depending on whether yfinance answered — 50 stocks one refresh,
+    3222 the next. Feeding the heatmap from that made every sector's average,
+    stock count and even the list of sectors change on each poll.
+
+    This is pure SQL over the last two closes, restricted to index members, so
+    the same input always produces the same heatmap. `industry` also matches
+    the label the screener filters on, which is what makes the click-through
+    from a tile land on a non-empty grid.
+    """
+    sql = """
+        WITH ranked AS (
+            SELECT symbol, close, date,
+                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) rn
+            FROM prices_daily
+        ),
+        sectors AS (
+            SELECT symbol, MIN(industry) AS industry
+              FROM index_members WHERE industry IS NOT NULL
+             GROUP BY symbol
+        )
+        SELECT r1.symbol AS symbol, s.industry AS sector,
+               (r1.close - r2.close) / r2.close * 100.0 AS chg
+        FROM ranked r1
+        JOIN ranked r2 ON r1.symbol = r2.symbol AND r1.rn = 1 AND r2.rn = 2
+        JOIN sectors s ON s.symbol = r1.symbol
+        WHERE r2.close > 0
+    """
+    try:
+        with get_connection() as conn:
+            return [{"symbol": r["symbol"], "sector": r["sector"],
+                     "chg": round(r["chg"], 2)}
+                    for r in conn.execute(sql).fetchall()]
     except Exception:
         return []
 
@@ -182,7 +224,13 @@ def get_market_pulse() -> dict:
     declining = sum(1 for c in changes if c["chg"] < 0)
     pct = round(advancing / total * 100) if total else 0
 
-    sectors = _sector_breadth(changes)
+    # Sector rotation is computed from its own stable universe, NOT from
+    # `changes` — that variable is whichever of two very differently sized
+    # sources answered this time, so the heatmap it produced was different on
+    # every refresh. Falls back to `changes` only if no index membership has
+    # been ingested at all.
+    sector_rows = _sector_changes() or changes
+    sectors = _sector_breadth(sector_rows)
     ranked = sorted(changes, key=lambda c: c["chg"], reverse=True)
     mood_label, mood_key = _mood(pct, idx_raw)
 
@@ -199,6 +247,7 @@ def get_market_pulse() -> dict:
         "mood_key": mood_key,
         "universe": total,
         "universe_label": universe_label,
+        "sector_universe": len(sector_rows),
         "generated_ist": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
     }
 

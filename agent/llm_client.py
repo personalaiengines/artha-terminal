@@ -5,6 +5,7 @@ OpenRouter and Nvidia NIM API support with automatic fallback.
 
 import httpx
 import json
+import time
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
 import os
@@ -48,16 +49,12 @@ class OpenRouterClient(LLMClient):
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "model": self._current_model,
-            "messages": messages,
-            "tool_choice": "auto" if tools else None,
-        }
-
+        payload = {"model": self._current_model, "messages": messages}
         if tools:
             payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.post(self.base_url, headers=headers, json=payload)
 
             if response.status_code == 401:
@@ -69,61 +66,7 @@ class OpenRouterClient(LLMClient):
     async def tool_use_loop(
         self, messages: list, tools: list[Callable]
     ) -> tuple[str, list]:
-        """Iterative tool-use loop with automatic chat completion."""
-        tool_registry = {t.__name__: t for t in tools}
-
-        max_iterations = 10
-        conversation = list(messages)
-        tool_calls_log = []
-
-        for _ in range(max_iterations):
-            response = await self.chat(conversation, tools=list(tool_registry.keys()))
-
-            choice = response["choices"][0]
-            message = choice["message"]
-
-            # Check for tool calls
-            if "tool_calls" in message and message["tool_calls"]:
-                for tc in message["tool_calls"]:
-                    tool_name = tc["function"]["name"]
-                    tool_args = json.loads(tc["function"]["arguments"])
-
-                    # Add assistant's tool call to conversation
-                    conversation.append(message)
-
-                    if tool_name in tool_registry:
-                        try:
-                            result = await tool_registry[tool_name](**tool_args)
-                            tool_calls_log.append({
-                                "tool": tool_name,
-                                "args": tool_args,
-                                "result": result,
-                            })
-
-                            # Add tool result to conversation
-                            conversation.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": json.dumps(result),
-                            })
-                        except Exception as e:
-                            conversation.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": f"Error: {str(e)}",
-                            })
-                    else:
-                        conversation.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": f"Unknown tool: {tool_name}",
-                        })
-                continue  # Continue loop to process tool results
-
-            # Final answer
-            return message.get("content", ""), tool_calls_log
-
-        raise RuntimeError("Max tool-use iterations exceeded")
+        return await _generic_tool_use_loop(self, messages, tools)
 
 
 class AnthropicClient(LLMClient):
@@ -298,16 +241,12 @@ class NvidiaNIMClient(LLMClient):
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "tool_choice": "auto" if tools else None,
-        }
-
+        payload = {"model": self.model, "messages": messages}
         if tools:
             payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.post(self.base_url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
@@ -315,123 +254,312 @@ class NvidiaNIMClient(LLMClient):
     async def tool_use_loop(
         self, messages: list, tools: list[Callable]
     ) -> tuple[str, list]:
-        """Iterative tool-use loop (same logic as OpenRouter)."""
-        tool_registry = {t.__name__: t for t in tools}
+        return await _generic_tool_use_loop(self, messages, tools)
 
-        max_iterations = 10
-        conversation = list(messages)
-        tool_calls_log = []
 
-        for _ in range(max_iterations):
-            response = await self.chat(conversation, tools=list(tool_registry.keys()))
+class SambaNovaClient(LLMClient):
+    """SambaNova Cloud free tier — fast, small (~8K) context. Same OpenAI-chat
+    shape as OpenRouter/NIM, plain bearer-token REST, no vendor SDK needed."""
 
-            choice = response["choices"][0]
-            message = choice["message"]
+    def __init__(self):
+        self.base_url = "https://api.sambanova.ai/v1/chat/completions"
+        self.api_key = config.ai.sambanova_api_key
+        self.model = config.ai.sambanova_model
 
-            if "tool_calls" in message and message["tool_calls"]:
-                for tc in message["tool_calls"]:
-                    tool_name = tc["function"]["name"]
-                    tool_args = json.loads(tc["function"]["arguments"])
+    async def chat(self, messages: list, tools: list = None) -> dict:
+        if not self.api_key:
+            raise ValueError("SambaNova API key not configured")
 
-                    conversation.append(message)
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {"model": self.model, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
-                    if tool_name in tool_registry:
-                        try:
-                            result = await tool_registry[tool_name](**tool_args)
-                            tool_calls_log.append({
-                                "tool": tool_name,
-                                "args": tool_args,
-                                "result": result,
-                            })
-                            conversation.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": json.dumps(result),
-                            })
-                        except Exception as e:
-                            conversation.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": f"Error: {str(e)}",
-                            })
-                continue
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(self.base_url, headers=headers, json=payload)
+            if response.status_code == 401:
+                raise ValueError("SambaNova API key invalid or exhausted")
+            response.raise_for_status()
+            return response.json()
 
-            return message.get("content", ""), tool_calls_log
+    async def tool_use_loop(self, messages: list, tools: list[Callable]) -> tuple[str, list]:
+        return await _generic_tool_use_loop(self, messages, tools)
 
-        raise RuntimeError("Max tool-use iterations exceeded")
+
+class GitHubModelsClient(LLMClient):
+    """GitHub Models free tier — 128K context, auth via a GitHub PAT
+    (`models: read` scope) rather than a vendor API key."""
+
+    def __init__(self):
+        self.base_url = "https://models.inference.ai.azure.com/chat/completions"
+        self.api_key = config.ai.github_models_token
+        self.model = config.ai.github_models_model
+
+    async def chat(self, messages: list, tools: list = None) -> dict:
+        if not self.api_key:
+            raise ValueError("GitHub Models token not configured")
+
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {"model": self.model, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(self.base_url, headers=headers, json=payload)
+            if response.status_code == 401:
+                raise ValueError("GitHub Models token invalid or exhausted")
+            response.raise_for_status()
+            return response.json()
+
+    async def tool_use_loop(self, messages: list, tools: list[Callable]) -> tuple[str, list]:
+        return await _generic_tool_use_loop(self, messages, tools)
+
+
+async def _generic_tool_use_loop(client: LLMClient, messages: list, tools: list[Callable]) -> tuple[str, list]:
+    """Shared tool-use loop body for the OpenAI-chat-shaped clients (same logic
+    OpenRouterClient/NvidiaNIMClient already duplicate) — reused by the two new
+    tiers instead of copy-pasting a third/fourth time."""
+    tool_registry = {t.__name__: t for t in tools}
+    max_iterations = 10
+    conversation = list(messages)
+    tool_calls_log = []
+
+    for _ in range(max_iterations):
+        response = await client.chat(conversation, tools=list(tool_registry.keys()))
+        message = response["choices"][0]["message"]
+
+        if message.get("tool_calls"):
+            conversation.append(message)
+            for tc in message["tool_calls"]:
+                tool_name = tc["function"]["name"]
+                tool_args = json.loads(tc["function"]["arguments"])
+                if tool_name in tool_registry:
+                    try:
+                        result = await tool_registry[tool_name](**tool_args)
+                        tool_calls_log.append({"tool": tool_name, "args": tool_args, "result": result})
+                        conversation.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
+                    except Exception as e:
+                        conversation.append({"role": "tool", "tool_call_id": tc["id"], "content": f"Error: {str(e)}"})
+                else:
+                    conversation.append({"role": "tool", "tool_call_id": tc["id"], "content": f"Unknown tool: {tool_name}"})
+            continue
+
+        return message.get("content", ""), tool_calls_log
+
+    raise RuntimeError("Max tool-use iterations exceeded")
+
+
+def _request_parts(client: LLMClient) -> tuple[str, dict, str]:
+    """(url, headers, model) for the four OpenAI-chat-shaped clients."""
+    model = client._current_model if isinstance(client, OpenRouterClient) else client.model
+    headers = {"Authorization": f"Bearer {client.api_key}", "Content-Type": "application/json"}
+    if isinstance(client, OpenRouterClient):
+        headers |= {"HTTP-Referer": "https://artha.local", "X-Title": "ARTHA Terminal"}
+    return client.base_url, headers, model
+
+
+async def _stream_openai_chat(client: LLMClient, messages: list):
+    """Yield text deltas from an OpenAI-shaped /chat/completions SSE stream.
+
+    All four free tiers speak the same `data: {...}` / `data: [DONE]` wire
+    format, so one helper covers them. Tools are deliberately not supported
+    here — streaming is only for the final narrative turn, after any tool work
+    has already finished.
+    """
+    if not client.api_key:
+        raise ValueError(f"{type(client).__name__} not configured")
+    url, headers, model = _request_parts(client)
+    payload = {"model": model, "messages": messages, "stream": True}
+    async with httpx.AsyncClient(timeout=120.0) as http:
+        async with http.stream("POST", url, headers=headers, json=payload) as resp:
+            if resp.status_code >= 400:
+                # Body must be read before the status error is useful, and
+                # raise_for_status() on an unread stream gives no detail.
+                await resp.aread()
+                resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    return
+                try:
+                    delta = json.loads(data)["choices"][0]["delta"].get("content")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                if delta:
+                    yield delta
+
+
+class AllTiersExhausted(RuntimeError):
+    """Every free-tier LLM (and, if opted-in, paid Anthropic) failed. Distinct
+    from other RuntimeErrors so callers can surface a specific "AI temporarily
+    unavailable" message instead of a generic failure."""
+
+    def __init__(self, errors: list[str]):
+        self.errors = errors
+        super().__init__("All free-tier LLM providers exhausted: " + "; ".join(errors))
 
 
 class ModelRouter:
-    """Automatic fallback router between LLM providers."""
+    """Tiered free-only router. Anthropic is opt-in only (paid, used solely if
+    ANTHROPIC_API_KEY is explicitly set) — never part of the default chain.
+
+    `task_shape` picks which free tier goes first:
+      'quick' — sentiment/curation/debate turns: SambaNova first (fast, small context)
+      'deep'  — report synthesis/long context: GitHub Models first (128K context)
+    Both shapes fall through the same OpenRouter-free → NIM-free rungs after that.
+    """
+
+    # Runtime skip-list: a tier that 404/410s (model retired) or 429s (quota
+    # hit) gets cooled down automatically so it doesn't eat a guaranteed-fail
+    # round trip on every subsequent request — self-heals when the cooldown
+    # expires, no config edit needed. Class-level: ModelRouter is constructed
+    # fresh per request, but the skip-list must survive across requests.
+    _cooldown: dict[str, float] = {}
 
     def __init__(self):
         self.anthropic = AnthropicClient()
-        self.openrouter = OpenRouterClient()
-        self.nvidia = NvidiaNIMClient()
-        self.model_chain = config.ai.get_model_chain()
-        self._current_index = 0
+        self.clients: dict[str, LLMClient] = {
+            "openrouter": OpenRouterClient(),
+            "nvidia": NvidiaNIMClient(),
+            "sambanova": SambaNovaClient(),
+            "github": GitHubModelsClient(),
+        }
 
-    async def chat(self, messages: list, tools: list = None) -> dict:
-        """Direct Anthropic first (when configured), then OpenRouter/NIM chain."""
+    @staticmethod
+    def _cooldown_seconds(exc: Exception) -> Optional[int]:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (404, 410):
+            return 6 * 3600   # model retired/removed upstream
+        if status == 429:
+            return 5 * 60     # rate limited — quota resets fast
+        return None            # transient (timeout/5xx/connection) — retry next request
+
+    @staticmethod
+    def _set_model(client: LLMClient, model: str) -> None:
+        if isinstance(client, OpenRouterClient):
+            client._current_model = model
+        else:
+            client.model = model
+
+    @staticmethod
+    def _compress_if_needed(tier, messages: list) -> list:
+        """Only SambaNova has a small free-tier context ceiling worth
+        compressing for — GitHub Models (128K), OpenRouter and NIM don't need
+        this, so skip the (lossy) compression pass for them entirely."""
+        if tier.provider != "sambanova":
+            return messages
+        from agent.context_window import compress_for_tier
+        return compress_for_tier(messages, config.ai.SAMBANOVA_CONTEXT_CEILING)
+
+    @staticmethod
+    def _chain_for(task_shape: str, tools: list = None) -> list:
+        """GitHub Models' free-tier gateway rejects this app's full tool
+        registry (8 schemas + a long system prompt) — 400 on the very first
+        tool-bearing call, 413 on every one after as the conversation grows.
+        Verified against the real endpoint: a single small tool schema works
+        fine, the full registry doesn't. Every tool-loop iteration was wasting
+        a guaranteed-fail round-trip on it before falling through to
+        OpenRouter — skip it whenever tools are attached, not worth vendoring
+        a payload-splitting workaround for a free tier."""
+        chain = config.ai.get_tier_chain(task_shape)
+        if tools:
+            chain = [t for t in chain if t.provider != "github"]
+        now = time.time()
+        available = [t for t in chain if ModelRouter._cooldown.get(f"{t.provider}:{t.model}", 0) <= now]
+        return available or chain  # all cooled down — try anyway rather than give up with zero attempts
+
+    async def chat(self, messages: list, tools: list = None, task_shape: str = "deep") -> dict:
         if self.anthropic.api_key:
             try:
                 return await self.anthropic.chat(messages, tools)
             except Exception as e:
                 print(f"[warn] Anthropic failed ({self.anthropic.model}): {e}; falling back")
 
-        for i in range(len(self.model_chain)):
+        errors = []
+        for tier in self._chain_for(task_shape, tools):
+            client = self.clients[tier.provider]
+            self._set_model(client, tier.model)
+            tier_messages = self._compress_if_needed(tier, messages)
+            key = f"{tier.provider}:{tier.model}"
             try:
-                if i == 0 or i == 1:  # OpenRouter models
-                    client = self.openrouter
-                    if i == 0:
-                        client._current_model = self.model_chain[0]
-                    else:
-                        client._current_model = self.model_chain[1]
-                else:  # Nvidia models
-                    client = self.nvidia
-                    if i == 2:
-                        client.model = self.model_chain[2]
-                    else:
-                        client.model = self.model_chain[3]
-
-                return await client.chat(messages, tools)
-
+                result = await client.chat(tier_messages, tools)
+                self._cooldown.pop(key, None)
+                return result
             except Exception as e:
-                print(f"[warn] Provider failed ({self.model_chain[i]}): {e}")
+                errors.append(f"{tier.provider}({tier.model}): {e}")
+                print(f"[warn] Provider failed ({tier.provider}/{tier.model}): {e}")
+                secs = self._cooldown_seconds(e)
+                if secs:
+                    self._cooldown[key] = time.time() + secs
+                    print(f"[warn] Cooling down {key} for {secs}s")
                 continue
 
-        raise RuntimeError("All LLM providers failed")
+        raise AllTiersExhausted(errors)
 
-    async def tool_use_loop(
-        self, messages: list, tools: list[Callable]
-    ) -> tuple[str, list]:
-        """Try direct Anthropic first, then OpenRouter, then NIM on any failure
-        (402, rate limit, …).
+    async def stream(self, messages: list, task_shape: str = "deep"):
+        """Yield text deltas, walking the same tier chain (and cooldowns) as chat().
 
-        Previously OpenRouter-only: if it errored (e.g. no credits) the agent never
-        reached the free NIM tier. Now NIM is a real fallback for every OpenRouter call.
+        Anthropic is skipped even when opted in — it's a different wire format
+        and this path is only used by the conversational UI, which runs on the
+        free chain by design.
         """
         errors = []
+        for tier in self._chain_for(task_shape):
+            client = self.clients[tier.provider]
+            self._set_model(client, tier.model)
+            key = f"{tier.provider}:{tier.model}"
+            sent = False
+            try:
+                async for delta in _stream_openai_chat(client, self._compress_if_needed(tier, messages)):
+                    sent = True
+                    yield delta
+            except Exception as e:
+                if sent:
+                    # Text already reached the user. Failing over now would
+                    # restart the answer mid-sentence in the UI — stop instead.
+                    print(f"[warn] Stream broke mid-answer ({key}): {e}")
+                    return
+                errors.append(f"{tier.provider}({tier.model}): {e}")
+                secs = self._cooldown_seconds(e)
+                if secs:
+                    self._cooldown[key] = time.time() + secs
+                continue
+            if sent:
+                self._cooldown.pop(key, None)
+                return
+            errors.append(f"{tier.provider}({tier.model}): empty stream")
+        raise AllTiersExhausted(errors)
+
+    async def tool_use_loop(
+        self, messages: list, tools: list[Callable], task_shape: str = "deep"
+    ) -> tuple[str, list]:
         if self.anthropic.api_key:
             try:
                 return await self.anthropic.tool_use_loop(messages, tools)
             except Exception as e:
-                errors.append(f"Anthropic({self.anthropic.model}): {e}")
-                print(f"[warn] Anthropic tool-loop failed: {e}; falling back to OpenRouter")
-        if self.openrouter.api_key:
+                print(f"[warn] Anthropic tool-loop failed: {e}; falling back")
+
+        errors = []
+        for tier in self._chain_for(task_shape, tools):
+            client = self.clients[tier.provider]
+            self._set_model(client, tier.model)
+            tier_messages = self._compress_if_needed(tier, messages)
+            key = f"{tier.provider}:{tier.model}"
             try:
-                self.openrouter._current_model = self.model_chain[0]
-                return await self.openrouter.tool_use_loop(messages, tools)
+                result = await client.tool_use_loop(tier_messages, tools)
+                self._cooldown.pop(key, None)
+                return result
             except Exception as e:
-                errors.append(f"OpenRouter({self.model_chain[0]}): {e}")
-                print(f"[warn] OpenRouter tool-loop failed: {e}; falling back to NIM")
-        if self.nvidia.api_key:
-            # Prefer a tool-capable NIM model (llama-3.3-70b handles function calls).
-            nim_model = next((m for m in self.model_chain if "meta/" in m or "nvidia/" in m), None)
-            if nim_model:
-                self.nvidia.model = nim_model
-            try:
-                return await self.nvidia.tool_use_loop(messages, tools)
-            except Exception as e:
-                errors.append(f"NIM({self.nvidia.model}): {e}")
-        raise RuntimeError("All LLM providers failed for tool-use: " + "; ".join(errors) or "No LLM provider available")
+                errors.append(f"{tier.provider}({tier.model}): {e}")
+                print(f"[warn] Provider tool-loop failed ({tier.provider}/{tier.model}): {e}")
+                secs = self._cooldown_seconds(e)
+                if secs:
+                    self._cooldown[key] = time.time() + secs
+                    print(f"[warn] Cooling down {key} for {secs}s")
+                continue
+
+        raise AllTiersExhausted(errors)

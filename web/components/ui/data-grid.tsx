@@ -13,7 +13,7 @@ export type Column<T> = {
   align?: "left" | "right" | "center";
   width?: string;
   sortable?: boolean;
-  sortValue?: (row: T) => number | string;
+  sortValue?: (row: T) => number | string | null | undefined;
   cell: (row: T) => ReactNode;
 };
 
@@ -35,6 +35,14 @@ export function DataGrid<T>({
     if (!col?.sortValue) return rows;
     return [...rows].sort((a, b) => {
       const av = col.sortValue!(a), bv = col.sortValue!(b);
+      // Rows with no value for this column always sink to the bottom, in both
+      // directions — otherwise null/undefined compares as 0 and a stock with
+      // no P/E at all would rank as the "cheapest" in an ascending sort.
+      const aMissing = av === null || av === undefined;
+      const bMissing = bv === null || bv === undefined;
+      if (aMissing && bMissing) return 0;
+      if (aMissing) return 1;
+      if (bMissing) return -1;
       if (av < bv) return -1 * sort.dir;
       if (av > bv) return 1 * sort.dir;
       return 0;
