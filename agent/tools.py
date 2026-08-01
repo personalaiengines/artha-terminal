@@ -189,6 +189,35 @@ TOOL_SCHEMAS = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_institutional_flows",
+            "description": "Market-wide FII/DII net cash flows for the latest published session, with the multi-day trend. Market level, not per-symbol — takes no arguments",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_index_membership",
+            "description": "Which NSE indices a symbol belongs to (NIFTY 50, Bank Nifty, sector indices), plus NSE's own industry label",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock symbol"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
     }
 ]
 
@@ -268,7 +297,13 @@ async def get_price_history(
         df = df[df["date"] <= end_date]
     # Cap the payload back to the LLM — it doesn't need 5 years of daily candles.
     rows = df.tail(180).to_dict("records")
-    return {"symbol": symbol, "data": rows, "metrics": snap["metrics"], "status": "OK"}
+    # `data` is ascending (oldest first, most recent last) — free-tier models
+    # were observed citing an early/arbitrary row as "latest" instead of
+    # scanning to the end of a 180-row array. Surface latest_close/latest_date
+    # as explicit top-level fields so there's nothing to infer.
+    return {"symbol": symbol, "data": rows, "metrics": snap["metrics"],
+            "latest_close": snap.get("latest_close"), "latest_date": snap.get("latest_date"),
+            "status": "OK"}
 
 
 @registry.register
@@ -356,6 +391,75 @@ async def search_market(query: str, limit: int = 10) -> dict:
     from services.instruments import search as _search_instruments
     results = await asyncio.to_thread(_search_instruments, query, limit)
     return {"query": query, "results": results, "status": "OK"}
+
+
+# The market-wide FII/DII reading is the same for every symbol in a run, and
+# fetching it hits NSE (which is flaky enough that the service retries with
+# backoff). Share the per-symbol snapshot cache under a reserved key so a loop
+# that calls the tool twice pays for one fetch.
+_FLOWS_KEY = "__fii_dii__"
+
+
+def _get_flows() -> dict:
+    from services.institutional_flows import get_institutional_snapshot
+    hit = _snap_cache.get(_FLOWS_KEY)
+    if hit and time.time() - hit[0] < _SNAP_TTL:
+        return hit[1] or {}
+    snap = get_institutional_snapshot() or {}
+    _snap_cache[_FLOWS_KEY] = (time.time(), snap)
+    return snap
+
+
+@registry.register
+async def get_institutional_flows() -> dict:
+    """Market-wide FII/DII net cash flows for the latest published session."""
+    snap = await asyncio.to_thread(_get_flows)
+    fii, dii = (snap.get("fii") or {}), (snap.get("dii") or {})
+    if fii.get("net") is None and dii.get("net") is None:
+        # NSE publishes this once a day and the fetch can fail outright. Say so
+        # — an absent reading is not a neutral one.
+        return {"available": False, "status": "NOT_FOUND",
+                "message": "No FII/DII flow reading is available. State that "
+                           "institutional flows are unavailable; do not infer a direction."}
+    trend = snap.get("trend") or {}
+    return {
+        "available": True,
+        "date": snap.get("date"),
+        "unit": "Rs Cr, net cash market",
+        "fii_net": fii.get("net"), "fii_stance": snap.get("fii_key"),
+        "dii_net": dii.get("net"), "dii_stance": snap.get("dii_key"),
+        # True when the live NSE call failed and this is the last stored reading.
+        "stale": snap.get("stale", False),
+        "fii_streak_days": trend.get("fii_streak"), "dii_streak_days": trend.get("dii_streak"),
+        "fii_sum_10d": trend.get("fii_sum"), "dii_sum_10d": trend.get("dii_sum"),
+        "status": "OK",
+    }
+
+
+def _index_rows(symbol: str) -> list[dict]:
+    from db import get_connection
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT index_key, index_name, industry FROM index_members "
+            "WHERE symbol = ? ORDER BY index_name",
+            (symbol,),
+        ).fetchall()]
+
+
+@registry.register
+async def get_index_membership(symbol: str) -> dict:
+    """Which NSE indices a symbol belongs to, from the stored constituent pull."""
+    sym = symbol.strip().upper()
+    rows = await asyncio.to_thread(_index_rows, sym)
+    if not rows:
+        # Most of the ~5,000-symbol universe is in no index at all — that is a
+        # real answer about the stock, not a data gap to paper over.
+        return {"symbol": sym, "indices": [], "available": False, "status": "NOT_FOUND",
+                "message": f"{sym} is not a constituent of any index stored in ARTHA's "
+                           f"database. Say it is in no tracked index; do not name one."}
+    industry = next((r["industry"] for r in rows if r.get("industry")), None)
+    return {"symbol": sym, "indices": rows, "industry": industry,
+            "available": True, "status": "OK"}
 
 
 def get_tools_for_llm() -> list[dict]:

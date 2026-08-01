@@ -1,15 +1,11 @@
 import { NextResponse } from "next/server";
+import { fromApi } from "@/lib/api-server";
 
-// Real Upstox holdings. No mock: passes through ok:false + status
-// (expired/missing) so the UI can prompt re-authorization rather than faking
-// positions. Direct fetch (not fromApi) to preserve the ok:false status.
-const BASE = process.env.ARTHA_API_URL ?? "http://localhost:8000";
-
+// Real Upstox holdings. No mock: an expired/missing token comes back as
+// ok:false with an empty book so the UI prompts re-authorization (the banner
+// reads the reason from /api/system/status) rather than faking positions.
 export async function GET() {
-  try {
-    const res = await fetch(`${BASE}/api/holdings`, { cache: "no-store" });
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ ok: false, status: "error", items: [] });
-  }
+  const r = await fromApi<any>("/api/holdings", 10000);
+  if (!r) return NextResponse.json({ ok: false, status: "error", items: [] });
+  return NextResponse.json(r);
 }

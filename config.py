@@ -14,22 +14,66 @@ load_dotenv()
 
 
 @dataclass
+class TierSpec:
+    """One rung of a task-shape routing chain: which client + which model."""
+    provider: str  # key into ModelRouter's client dict: sambanova/github/openrouter/nvidia
+    model: str
+
+
+@dataclass
 class AIConfig:
     """AI/LLM configuration with fallback hierarchy."""
     provider: str = "openrouter"  # openrouter (free models, primary), nvidia (fallback)
     primary_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     fallback_model_1: str = "nvidia/nemotron-3-super-120b-a12b:free"
-    fallback_model_2: str = "qwen/qwen3-next-80b-a3b-instruct"
-    fallback_model_3: str = "meta/llama-3.3-70b-instruct"
+    # Both original NIM rungs were dead. Probed live against
+    # integrate.api.nvidia.com on 2026-07-30: meta/llama-3.1-405b-instruct ->
+    # HTTP 404 (retired), qwen/qwen3-next-80b-a3b-instruct (what .env.example
+    # recommended) -> HTTP 410 Gone, meta/llama-3.3-70b-instruct -> no answer
+    # inside 70s. All three could never win a race they were configured to run.
+    #
+    # Replacements chosen by probing the whole catalogue with the app's real
+    # tool-calling prompt, fastest-first (all HTTP 200 with a clean tool_call):
+    #   mistralai/mistral-nemotron            0.6s
+    #   deepseek-ai/deepseek-v4-pro           1.4s
+    #   deepseek-ai/deepseek-v4-flash         8.3s
+    #   nvidia/llama-3.3-nemotron-super-49b   7.3s
+    #   z-ai/glm-5.2                         31.8s   (works, too slow to rank)
+    #   minimaxai/minimax-m3                 31.3s   (and returned no tool_call)
+    # Empty = disabled. A model id goes in only after `scripts/ai_check.py models`
+    # shows it answering.
+    fallback_model_2: str = "mistralai/mistral-nemotron"
+    fallback_model_3: str = "deepseek-ai/deepseek-v4-pro"
+
+    # Groq — fastest rung by an order of magnitude (0.5s vs 7-25s), 131K context,
+    # tool-calling verified. Serves both task shapes, so it leads both chains.
+    groq_api_key: Optional[str] = None
+    groq_model: str = "openai/gpt-oss-120b"
+
+    # Google Gemini free tier, via Google's OpenAI-compatible endpoint. A quota
+    # pool independent of SambaNova/OpenRouter, which both 429 regularly.
+    # Probed live: gemini-flash-latest 3.3s, gemini-flash-lite-latest 0.5s, both
+    # returning proper tool_calls.
+    google_api_key: Optional[str] = None
+    google_model: str = "gemini-flash-latest"
 
     # Direct Anthropic API — OPTIONAL, PAID. Off unless ANTHROPIC_API_KEY is
-    # explicitly set; the free OpenRouter/NIM chain below is the default path.
+    # explicitly set; the free tiered chain below is the default path.
     anthropic_api_key: Optional[str] = None
     anthropic_model: str = "claude-sonnet-5"
 
     # API Keys
     openrouter_api_key: Optional[str] = None
     nvidia_api_key: Optional[str] = None
+    sambanova_api_key: Optional[str] = None
+    github_models_token: Optional[str] = None  # GitHub PAT with `models: read`
+
+    sambanova_model: str = "Meta-Llama-3.3-70B-Instruct"
+    github_models_model: str = "Llama-3.3-70B-Instruct"
+
+    # Approximate free-tier context ceiling used as a routing/compression
+    # signal only — providers don't guarantee this exactly.
+    SAMBANOVA_CONTEXT_CEILING: int = 8000
 
     @property
     def has_anthropic(self) -> bool:
@@ -43,14 +87,58 @@ class AIConfig:
     def has_nvidia(self) -> bool:
         return bool(self.nvidia_api_key)
 
-    def get_model_chain(self) -> list[str]:
-        """Return ordered list of models to try."""
-        chain = []
+    @property
+    def has_sambanova(self) -> bool:
+        return bool(self.sambanova_api_key)
+
+    @property
+    def has_github_models(self) -> bool:
+        return bool(self.github_models_token)
+
+    @property
+    def has_groq(self) -> bool:
+        return bool(self.groq_api_key)
+
+    @property
+    def has_google(self) -> bool:
+        return bool(self.google_api_key)
+
+    def get_tier_chain(self, task_shape: str = "deep") -> list["TierSpec"]:
+        """Ordered free-tier chain to try for a given task shape.
+
+        Groq leads both shapes: measured live it answers in 0.5s against 7-25s
+        for every other rung, carries a 131K context so it suits `deep` as well
+        as `quick`, and calls tools correctly. Everything below it is a fallback
+        for when its free quota runs out.
+
+        'quick': small/fast tasks (sentiment tags, curation, debate turns) —
+                 then SambaNova (fast, small context), then the general chain.
+        'deep':  long-context tasks (report synthesis, full history) —
+                 then GitHub Models (128K context), then the general chain.
+        """
+        chain: list[TierSpec] = []
+        if self.has_groq:
+            chain.append(TierSpec("groq", self.groq_model))
+        # Second, on an independent quota pool — the rung most likely to still be
+        # answering when Groq's free allowance runs out.
+        if self.has_google:
+            chain.append(TierSpec("google", self.google_model))
+        if task_shape == "quick" and self.has_sambanova:
+            chain.append(TierSpec("sambanova", self.sambanova_model))
+        if task_shape == "deep" and self.has_github_models:
+            chain.append(TierSpec("github", self.github_models_model))
         if self.has_openrouter:
-            chain.extend([self.primary_model, self.fallback_model_1])
+            chain.append(TierSpec("openrouter", self.primary_model))
+            chain.append(TierSpec("openrouter", self.fallback_model_1))
         if self.has_nvidia:
-            chain.extend([self.fallback_model_2, self.fallback_model_3])
-        return chain
+            chain.append(TierSpec("nvidia", self.fallback_model_2))
+            chain.append(TierSpec("nvidia", self.fallback_model_3))
+        # SambaNova is a separate free quota pool from OpenRouter/NIM — always
+        # keep it as a last-resort rung (front of chain already covers 'quick').
+        if task_shape == "deep" and self.has_sambanova:
+            chain.append(TierSpec("sambanova", self.sambanova_model))
+        # A rung with no model id is a disabled rung, not a rung that tries "".
+        return [t for t in chain if t.model]
 
 
 @dataclass
@@ -62,10 +150,15 @@ class SearchConfig:
     bing_api_key: Optional[str] = None
     jina_api_key: Optional[str] = None
     searxng_url: str = "http://localhost:8080"
+    finnhub_api_key: Optional[str] = None
 
     @property
     def has_serpapi(self) -> bool:
         return bool(self.serpapi_key)
+
+    @property
+    def has_finnhub(self) -> bool:
+        return bool(self.finnhub_api_key)
 
     @property
     def has_serper(self) -> bool:
@@ -127,10 +220,23 @@ class Config:
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             nvidia_api_key=os.getenv("NVIDIA_API_KEY"),
-            primary_model=os.getenv("OPENROUTER_PRIMARY_MODEL", "anthropic/claude-sonnet-4.5"),
-            fallback_model_1=os.getenv("OPENROUTER_FALLBACK_MODEL", "google/gemini-2.5-flash"),
-            fallback_model_2=os.getenv("NVIDIA_FALLBACK_MODEL", "qwen/qwen3-next-80b-a3b-instruct"),
-            fallback_model_3=os.getenv("NVIDIA_BACKUP_MODEL", "meta/llama-3.3-70b-instruct"),
+            # `or AIConfig.<field>` rather than a literal getenv default: the
+            # literals here used to be anthropic/claude-sonnet-4.5 and
+            # google/gemini-2.5-flash, which silently overrode the free-tier
+            # defaults declared on AIConfig and billed anyone who set only an
+            # OpenRouter key. One source of truth, and it is the free one.
+            primary_model=os.getenv("OPENROUTER_PRIMARY_MODEL") or AIConfig.primary_model,
+            fallback_model_1=os.getenv("OPENROUTER_FALLBACK_MODEL") or AIConfig.fallback_model_1,
+            fallback_model_2=os.getenv("NVIDIA_FALLBACK_MODEL") or AIConfig.fallback_model_2,
+            fallback_model_3=os.getenv("NVIDIA_BACKUP_MODEL") or AIConfig.fallback_model_3,
+            sambanova_api_key=os.getenv("SAMBANOVA_API_KEY"),
+            sambanova_model=os.getenv("SAMBANOVA_MODEL") or AIConfig.sambanova_model,
+            github_models_token=os.getenv("GITHUB_MODELS_TOKEN"),
+            github_models_model=os.getenv("GITHUB_MODELS_MODEL") or AIConfig.github_models_model,
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            groq_model=os.getenv("GROQ_MODEL") or AIConfig.groq_model,
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            google_model=os.getenv("GOOGLE_MODEL") or AIConfig.google_model,
         )
         self.search = SearchConfig(
             serpapi_key=os.getenv("SERPAPI_KEY"),
@@ -138,6 +244,7 @@ class Config:
             bing_api_key=os.getenv("BING_API_KEY"),
             jina_api_key=os.getenv("JINA_API_KEY"),
             searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8080"),
+            finnhub_api_key=os.getenv("FINNHUB_API_KEY"),
         )
         self.upstox = UpstoxConfig(
             analytics_token=os.getenv("UPSTOX_ANALYTICS_TOKEN"),
@@ -181,8 +288,11 @@ class Config:
         warnings = []
 
         # Check AI configuration
-        if not self.ai.has_openrouter and not self.ai.has_nvidia and not self.ai.has_anthropic:
-            warnings.append("⚠️ No AI provider configured. Set OPENROUTER_API_KEY or NVIDIA_API_KEY (both free-tier). ANTHROPIC_API_KEY is optional and paid.")
+        if not any([self.ai.has_openrouter, self.ai.has_nvidia, self.ai.has_sambanova,
+                    self.ai.has_github_models, self.ai.has_anthropic]):
+            warnings.append("⚠️ No AI provider configured. Set OPENROUTER_API_KEY, NVIDIA_API_KEY, "
+                             "SAMBANOVA_API_KEY, or GITHUB_MODELS_TOKEN (all free-tier). "
+                             "ANTHROPIC_API_KEY is optional and paid.")
 
         # Check search configuration
         if not self.search.has_serpapi and not self.search.has_serper:

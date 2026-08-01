@@ -47,6 +47,18 @@ INDICES: list[Market] = [
     Market("hangseng", "Hang Seng", "^HSI", "", "Asia/Hong_Kong", "XHKG", time(9, 30), time(16, 0)),
 ]
 
+# The home board. Keys match services.upstox.INDEX_KEYS so live index quotes
+# come straight from the authenticated Upstox feed; the yfinance ticker is only
+# the fallback for when the daily Upstox token has lapsed. XBOM is NSE/BSE's
+# shared session (09:15-15:30 IST) and carries the real holiday list.
+INDIA: list[Market] = [
+    Market("nifty50", "Nifty 50", "^NSEI", "", "Asia/Kolkata", "XBOM", time(9, 15), time(15, 30)),
+    Market("sensex", "Sensex", "^BSESN", "", "Asia/Kolkata", "XBOM", time(9, 15), time(15, 30)),
+    Market("banknifty", "Bank Nifty", "^NSEBANK", "", "Asia/Kolkata", "XBOM", time(9, 15), time(15, 30)),
+    Market("niftymidcap", "Nifty Midcap 50", "^NSEMDCP50", "", "Asia/Kolkata", "XBOM", time(9, 15), time(15, 30)),
+    Market("indiavix", "India VIX", "^INDIAVIX", "", "Asia/Kolkata", "XBOM", time(9, 15), time(15, 30)),
+]
+
 COMMODITIES: list[Market] = [
     Market("gold", "Gold", "GC=F", "$", "America/New_York", "COMEX"),
     Market("silver", "Silver", "SI=F", "$", "America/New_York", "COMEX"),
@@ -188,11 +200,70 @@ def _gift_nifty_row(now_utc: datetime) -> dict | None:
     }
 
 
+def _india_quotes() -> dict[str, dict]:
+    """{market_key: {price, change_pct}} for INDIA — Upstox live, yfinance fallback."""
+    import asyncio
+    from services.upstox import UpstoxClient
+
+    out: dict[str, dict] = {}
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            q = loop.run_until_complete(
+                UpstoxClient().get_index_quotes([m.key for m in INDIA]))
+        finally:
+            loop.close()
+    except Exception:
+        q = {}
+    for key, v in (q or {}).items():
+        # get_index_quotes answers {"error": "..."} when the token is gone.
+        if isinstance(v, dict) and v.get("value") is not None:
+            out[key] = {"price": v.get("value"), "change_pct": v.get("change")}
+
+    missing = [m for m in INDIA if m.key not in out]
+    if missing:
+        prices = _fetch_prices([m.symbol for m in missing])
+        for m in missing:
+            p = prices.get(m.symbol) or {}
+            if p.get("price") is not None:
+                out[m.key] = p
+    return out
+
+
+def get_india_board(now_utc: datetime | None = None) -> dict:
+    """Indian indices only (+ Gift Nifty), each with live price and session state.
+
+    The dashboard strip used to render `get_global_board()` — S&P, Nasdaq, FTSE —
+    on a terminal for Indian equities. This is the home board: Nifty/Sensex/Bank
+    Nifty/Midcap/VIX plus Gift Nifty, the overnight lead indicator.
+    """
+    now_utc = now_utc or datetime.now(ZoneInfo("UTC"))
+    quotes = _india_quotes()
+    rows = [{
+        "key": m.key, "name": m.name, "symbol": m.symbol, "unit": m.unit,
+        "price": (quotes.get(m.key) or {}).get("price"),
+        "change_pct": (quotes.get(m.key) or {}).get("change_pct"),
+        "status": market_status(m, now_utc),
+    } for m in INDIA]
+
+    gift = _gift_nifty_row(now_utc)   # best-effort; skipped when Upstox is down
+    if gift:
+        rows.insert(0, {"key": "giftnifty", **gift})
+
+    return {"indices": rows, "refreshed_at_utc": now_utc.isoformat()}
+
+
 def get_global_board(now_utc: datetime | None = None) -> dict:
     """
     Assemble the board: indices + commodities with live prices and status.
 
     Returns {"indices": [...], "commodities": [...], "refreshed_at_utc": iso}.
+
+    Gift Nifty deliberately does NOT appear here. It used to, and because this
+    board is cached for 300s while get_india_board() is cached for 20s, the same
+    contract rendered two different prices on one screen — the topbar ticker
+    fresh, the Markets page up to five minutes behind. It is an Indian index;
+    get_india_board() owns it.
     """
     now_utc = now_utc or datetime.now(ZoneInfo("UTC"))
     prices = _fetch_prices([m.symbol for m in _ALL.values()])
@@ -208,16 +279,12 @@ def get_global_board(now_utc: datetime | None = None) -> dict:
             })
         return rows
 
-    indices = _rows(INDICES)
-    gift = _gift_nifty_row(now_utc)   # best-effort; skip the tile if Upstox is down
-    if gift:
-        indices.insert(0, gift)
-
     return {
-        "indices": indices,
+        "indices": _rows(INDICES),
         "commodities": _rows(COMMODITIES),
         "refreshed_at_utc": now_utc.isoformat(),
     }
 
 
-__all__ = ["Market", "INDICES", "COMMODITIES", "market_status", "get_global_board"]
+__all__ = ["Market", "INDICES", "COMMODITIES", "INDIA", "market_status",
+           "get_global_board", "get_india_board"]

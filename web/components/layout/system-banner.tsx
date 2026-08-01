@@ -3,9 +3,11 @@ import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, ExternalLink, KeyRound, X, CheckCircle2, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useDataHealth } from "@/components/widgets/data-health";
+import Link from "next/link";
 
 type Status = {
-  upstox: { status: string; login_url: string | null; name: string | null };
+  upstox: { status: string; loginUrl: string | null; name: string | null };
   llm: { openrouter: boolean; nvidia: boolean };
 };
 
@@ -36,9 +38,14 @@ export function SystemBanner() {
     return () => { clearInterval(id); window.removeEventListener("artha:authorize", open); };
   }, [load]);
 
+  // Any feed serving last-known-good instead of live data. Surfaced here as
+  // well as on the Alerts page so a stale number is never read as a live one.
+  const health = useDataHealth();
+  const staleIssue = health.issues.find((i) => !i.source.startsWith("upstox_portfolio"));
+
   const upstoxBad = status && ["expired", "missing", "error"].includes(status.upstox.status);
   const llmBad = status && !status.llm.openrouter && !status.llm.nvidia;
-  const show = !dismissed && (upstoxBad || llmBad);
+  const show = !dismissed && (upstoxBad || llmBad || !!staleIssue);
 
   const submit = async () => {
     if (!code.trim() || busy) return;
@@ -49,7 +56,15 @@ export function SystemBanner() {
         body: JSON.stringify({ code }),
       }).then((x) => x.json());
       setResult({ ok: !!r.ok, message: r.message ?? (r.ok ? "Token saved." : "Failed.") });
-      if (r.ok) { setCode(""); setTimeout(() => { setModal(false); setResult(null); load(); }, 1400); }
+      if (r.ok) {
+        setCode("");
+        // Re-read status immediately (the API dropped its Upstox caches on a
+        // successful exchange) and pull every other hook forward, so the
+        // banner can't keep announcing "expired" after a token that worked.
+        load();
+        window.dispatchEvent(new Event("artha:refresh"));
+        setTimeout(() => { setModal(false); setResult(null); load(); }, 1400);
+      }
     } catch {
       setResult({ ok: false, message: "Network error — is the API container running?" });
     } finally {
@@ -70,8 +85,15 @@ export function SystemBanner() {
               <span className="text-[12.5px] font-medium text-frost">
                 {upstoxBad
                   ? <>Upstox daily authorization {status!.upstox.status === "missing" ? "is not set up" : "has expired"} — live quotes, holdings and option chains are degraded.</>
-                  : <>No LLM API key configured — AI analysis is running on canned fallbacks.</>}
+                  : llmBad
+                  ? <>No LLM API key configured — AI analysis is running on canned fallbacks.</>
+                  : <>{staleIssue!.title} — showing the last known-good data until it recovers.</>}
               </span>
+              {!upstoxBad && staleIssue && (
+                <Link href="/alerts" className="text-[12px] font-medium text-warn underline underline-offset-2 hover:text-frost">
+                  What's affected
+                </Link>
+              )}
               {upstoxBad && (
                 <Button size="sm" variant="secondary" className="!h-7 border-warn/40 text-warn" onClick={() => setModal(true)}>
                   <KeyRound size={13} /> Authorize now
@@ -107,8 +129,8 @@ export function SystemBanner() {
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-raised text-[11px] font-bold text-frost">1</span>
                   <span>
                     Log in to Upstox in a new tab.{" "}
-                    {status?.upstox.login_url && (
-                      <a href={status.upstox.login_url} target="_blank" rel="noreferrer"
+                    {status?.upstox.loginUrl && (
+                      <a href={status.upstox.loginUrl} target="_blank" rel="noreferrer"
                         className="inline-flex items-center gap-1 font-medium text-accent hover:underline">
                         Open Upstox login <ExternalLink size={12} />
                       </a>
@@ -117,7 +139,7 @@ export function SystemBanner() {
                 </li>
                 <li className="flex gap-2.5">
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-raised text-[11px] font-bold text-frost">2</span>
-                  <span>After login the browser redirects to a URL containing <code className="rounded bg-void px-1 text-[11px]">?code=…</code>. The page may show <i>“can’t connect”</i> — that’s expected; the code is still in the address bar. Copy the <b>whole URL</b> (or just the code) and paste it below.</span>
+                  <span>Upstox redirects back to ARTHA, which exchanges the code and finishes on its own — nothing to paste. Only if that page fails to load, copy the <b>whole URL</b> from the address bar into the box below.</span>
                 </li>
               </ol>
               <div className="mt-4 flex gap-2">

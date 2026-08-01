@@ -3,6 +3,7 @@ import { animate, motion, useInView } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
 import { ArrowUpRight, ArrowDownRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useUI } from "@/components/layout/ui-store";
 
 // Count-up number. Used for every headline metric so animation is uniform.
 export function AnimatedNumber({
@@ -33,16 +34,21 @@ export function AnimatedNumber({
 }
 
 export function DeltaPill({ value, pct, className }: { value?: number | null; pct: number | null | undefined; className?: string }) {
+  const { changeMode } = useUI();
   const p = typeof pct === "number" && Number.isFinite(pct) ? pct : 0;
   const up = p >= 0;
+  const hasAbs = typeof value === "number" && Number.isFinite(value);
+  // "abs" mode shows the ₹ change instead of %, only when an absolute value
+  // was actually given — generic (non-price) deltas that don't pass `value`
+  // always fall back to % since there's nothing to toggle to.
+  const showAbs = changeMode === "abs" && hasAbs;
   return (
     <span className={cn(
       "inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[12px] font-semibold tnum",
       up ? "bg-up-soft/50 text-up" : "bg-down-soft/50 text-down", className
     )}>
       {up ? <ArrowUpRight size={13} strokeWidth={2.6} /> : <ArrowDownRight size={13} strokeWidth={2.6} />}
-      {typeof value === "number" && Number.isFinite(value) && <span>{Math.abs(value).toFixed(2)} </span>}
-      {Math.abs(p).toFixed(2)}%
+      {showAbs ? `₹${Math.abs(value as number).toFixed(2)}` : `${Math.abs(p).toFixed(2)}%`}
     </span>
   );
 }

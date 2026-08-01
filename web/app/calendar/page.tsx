@@ -6,11 +6,12 @@ import { ImpactBadge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/primitives";
 import { EconEvent } from "@/lib/data";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 
 const DAY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export default function Calendar() {
-  const ECON_EVENTS = useApi<EconEvent[]>("/api/events", [], (j) => j.items);
+  const ECON_EVENTS = useApi<EconEvent[]>("/api/events", [], (j) => j.items, POLL.events);
   const byDate = ECON_EVENTS.reduce<Record<string, EconEvent[]>>((acc, e) => {
     (acc[e.date] ??= []).push(e); return acc;
   }, {});

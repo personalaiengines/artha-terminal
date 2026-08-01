@@ -9,6 +9,7 @@ import { Avatar, EmptyState } from "@/components/ui/primitives";
 import { ScoreRing } from "@/components/ui/stat";
 import { Stock } from "@/lib/data";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 
 const TEMPLATES = [
   { title: "Full Deep-Dive", desc: "Fundamentals, technicals, peers, SWOT & verdict", icon: FlaskConical,
@@ -20,7 +21,7 @@ const TEMPLATES = [
 ];
 
 export default function Research() {
-  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items);
+  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items, POLL.universe);
   return (
     <div>
       <PageHeader eyebrow="Intelligence" title="AI Research Workspace"

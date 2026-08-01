@@ -1,0 +1,112 @@
+{
+  "ok": true,
+  "spot": 23985.35,
+  "expiry": "2026-08-04",
+  "atm": 24000.0,
+  "pcr_oi": 0.93,
+  "max_pain": 24000.0,
+  "oi_walls": {
+    "call_wall": 24000.0,
+    "put_wall": 24000.0
+  },
+  "expected_move": {
+    "straddle": 298.0,
+    "upper": 24283.35,
+    "lower": 23687.35,
+    "pct": 1.2424250636325926
+  },
+  "atm_iv": 11.04,
+  "india_vix": 12.56,
+  "bias": {
+    "score": 50,
+    "label": "NEUTRAL",
+    "drivers": [
+      {
+        "name": "PCR",
+        "detail": "0.93 (balanced)",
+        "delta": 0
+      },
+      {
+        "name": "OI change",
+        "detail": "put\u2212call \u0394OI -1,908,920",
+        "delta": -0.5
+      }
+    ]
+  },
+  "strategy": {
+    "name": "Calendar / wait",
+    "note": "Range-bound but IV is low \u2014 little premium to sell; often a no-trade day.",
+    "iv_regime": "low",
+    "anchors": {
+      "call_wall": 24000.0,
+      "put_wall": 24000.0,
+      "em_upper": 24283.3,
+      "em_lower": 23687.3
+    }
+  },
+  "levels": [
+    {
+      "label": "Max Pain",
+      "price": 24000.0,
+      "kind": "maxpain"
+    },
+    {
+      "label": "Call OI Wall (R)",
+      "price": 24000.0,
+      "kind": "resistance"
+    },
+    {
+      "label": "Put OI Wall (S)",
+      "price": 24000.0,
+      "kind": "support"
+    },
+    {
+      "label": "Exp-Move Upper",
+      "price": 24283.3,
+      "kind": "range"
+    },
+    {
+      "label": "Exp-Move Lower",
+      "price": 23687.3,
+      "kind": "range"
+    },
+    {
+      "label": "Pivot R2",
+      "price": 24080.3,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot R1",
+      "price": 24032.8,
+      "kind": "resistance"
+    },
+    {
+      "label": "Pivot P",
+      "price": 23993.7,
+      "kind": "pivot"
+    },
+    {
+      "label": "Pivot S1",
+      "price": 23946.2,
+      "kind": "support"
+    },
+    {
+      "label": "Pivot S2",
+      "price": 23907.1,
+      "kind": "support"
+    },
+    {
+      "label": "Prev Day High",
+      "price": 24041.2,
+      "kind": "resistance"
+    },
+    {
+      "label": "Prev Day Low",
+      "price": 23954.6,
+      "kind": "support"
+    }
+  ],
+  "index": "nifty50",
+  "name": "NIFTY 50",
+  "generated_ist": "2026-07-29T08:45:02.170002+05:30"
+}

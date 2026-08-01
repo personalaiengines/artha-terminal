@@ -1,12 +1,14 @@
 "use client";
 import { useState } from "react";
-import { User, Plug, Palette, Bell, ShieldCheck, Check, AlertTriangle, KeyRound } from "lucide-react";
+import { User, Plug, Palette, Bell, ShieldCheck, Check, AlertTriangle, KeyRound, Database } from "lucide-react";
 import { PageHeader } from "@/components/widgets/page-header";
 import { Card, CardBody } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, Divider } from "@/components/ui/primitives";
+import { EtlPanel } from "@/components/widgets/etl-panel";
 import { useApi } from "@/lib/use-api";
+import { POLL } from "@/lib/poll";
 import { cn } from "@/lib/utils";
 
 type SysStatus = {
@@ -37,7 +39,7 @@ export default function Settings() {
   const [prefs, setPrefs] = useState({ reduceMotion: false, priceAlerts: true, aiAlerts: true, newsDigest: true, sound: false });
   const set = (k: keyof typeof prefs) => (v: boolean) => setPrefs((p) => ({ ...p, [k]: v }));
 
-  const sys = useApi<SysStatus | null>("/api/system/status", null, (j) => j as SysStatus);
+  const sys = useApi<SysStatus | null>("/api/system/status", null, (j) => j as SysStatus, POLL.systemStatus);
   const upStatus = sys?.upstox.status ?? "unknown";
   const upOk = upStatus === "ok" || upStatus === "connected";
   const savedDate = sys?.upstox.savedAt ? new Date(sys.upstox.savedAt).toLocaleString("en-IN") : null;
@@ -61,6 +63,7 @@ export default function Settings() {
           <Tabs tabs={[
             { id: "profile", label: "Profile", icon: <User size={14} /> },
             { id: "conn", label: "Connections", icon: <Plug size={14} /> },
+            { id: "data", label: "Data & Ingestion", icon: <Database size={14} /> },
             { id: "appear", label: "Appearance", icon: <Palette size={14} /> },
             { id: "notify", label: "Notifications", icon: <Bell size={14} /> },
             { id: "comp", label: "Compliance", icon: <ShieldCheck size={14} /> },
@@ -101,6 +104,8 @@ export default function Settings() {
                     <p className="pt-1 text-[11px] text-muted">Keys are managed via the backend <code className="rounded bg-void px-1 text-mist">.env</code> — never exposed to the client. Upstox holdings token expires daily (~03:30 IST).</p>
                   </div>
                 )}
+
+                {active === "data" && <EtlPanel />}
 
                 {active === "appear" && (
                   <div className="max-w-lg">

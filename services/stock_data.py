@@ -35,6 +35,40 @@ def _pct(v, scale_if_fraction: bool = True):
     return round(v, 2)
 
 
+def fundamentals_from_info(sym: str, info: dict) -> dict:
+    """Map a yfinance .info payload to the `fundamentals` table's columns.
+
+    Shared by the live per-symbol path (get_live_stock_data) and the batch
+    fundamentals ETL so the two can't drift. Kept as a pure mapping — the
+    caller owns fetching, which is what makes it reusable for both.
+    """
+    info = info or {}
+    return {
+        "symbol": sym,
+        "pe_ratio": info.get("trailingPE"),
+        "pb_ratio": info.get("priceToBook"),
+        "ps_ratio": info.get("priceToSalesTrailing12Months"),
+        "ev_ebitda": info.get("enterpriseToEbitda"),
+        # yfinance already returns dividendYield as a percent (e.g. 2.05 = 2.05%)
+        "dividend_yield": round(float(info["dividendYield"]), 2) if info.get("dividendYield") else None,
+        "roe": _pct(info.get("returnOnEquity")),
+        "roce": None,
+        "roic": None,
+        "gross_margin": _pct(info.get("grossMargins")),
+        "operating_margin": _pct(info.get("operatingMargins")),
+        "net_margin": _pct(info.get("profitMargins")),
+        # yfinance debtToEquity is a percentage (e.g. 45.6 => 0.456 ratio)
+        "debt_to_equity": round(info["debtToEquity"] / 100, 2) if info.get("debtToEquity") else None,
+        "current_ratio": info.get("currentRatio"),
+        "quick_ratio": info.get("quickRatio"),
+        "interest_coverage": None,
+        "revenue_ttm": info.get("totalRevenue"),
+        "pat_ttm": info.get("netIncomeToCommon"),
+        "book_value": info.get("bookValue"),
+        "source": "yfinance-live",
+    }
+
+
 def _returns_from_closes(closes) -> dict:
     """Trailing returns (%) from a daily close series, by trading-day offsets."""
     out = {k: None for k in ("return_1d", "return_1w", "return_1m", "return_3m",
@@ -198,9 +232,20 @@ def get_live_stock_data(symbol: str) -> dict | None:
     """
     import yfinance as yf
     import pandas as pd
+    from db import get_connection
 
     sym = symbol.strip().upper()
-    tk = yf.Ticker(f"{sym}.NS")
+    exchange = "NSE"
+    try:
+        with get_connection() as conn:
+            row = conn.execute("SELECT exchange FROM symbol_master WHERE symbol=?", (sym,)).fetchone()
+            if row and row["exchange"]:
+                exchange = row["exchange"]
+    except Exception:
+        pass
+    # BSE-only symbols (no NSE listing) need yfinance's .BO suffix instead of .NS.
+    suffix = ".NS" if exchange == "NSE" else ".BO"
+    tk = yf.Ticker(f"{sym}{suffix}")
 
     # --- price history (the anchor; if this fails the symbol is unusable) ---
     try:
@@ -237,30 +282,7 @@ def get_live_stock_data(symbol: str) -> dict | None:
         if info.get("longName") or info.get("trailingPE"):
             break
 
-    fundamentals = {
-        "symbol": sym,
-        "pe_ratio": info.get("trailingPE"),
-        "pb_ratio": info.get("priceToBook"),
-        "ps_ratio": info.get("priceToSalesTrailing12Months"),
-        "ev_ebitda": info.get("enterpriseToEbitda"),
-        # yfinance already returns dividendYield as a percent (e.g. 2.05 = 2.05%)
-        "dividend_yield": round(float(info["dividendYield"]), 2) if info.get("dividendYield") else None,
-        "roe": _pct(info.get("returnOnEquity")),
-        "roce": None,
-        "roic": None,
-        "gross_margin": _pct(info.get("grossMargins")),
-        "operating_margin": _pct(info.get("operatingMargins")),
-        "net_margin": _pct(info.get("profitMargins")),
-        # yfinance debtToEquity is a percentage (e.g. 45.6 => 0.456 ratio)
-        "debt_to_equity": round(info["debtToEquity"] / 100, 2) if info.get("debtToEquity") else None,
-        "current_ratio": info.get("currentRatio"),
-        "quick_ratio": info.get("quickRatio"),
-        "interest_coverage": None,
-        "revenue_ttm": info.get("totalRevenue"),
-        "pat_ttm": info.get("netIncomeToCommon"),
-        "book_value": info.get("bookValue"),
-        "source": "yfinance-live",
-    }
+    fundamentals = fundamentals_from_info(sym, info)
 
     # --- computed metrics from the real history ---
     dma_50 = round(float(closes.tail(50).mean()), 2) if len(closes) >= 50 else info.get("fiftyDayAverage")
@@ -286,7 +308,7 @@ def get_live_stock_data(symbol: str) -> dict | None:
         "symbol": sym,
         "company_name": info.get("longName") or info.get("shortName") or sym,
         "isin": info.get("isin"),
-        "exchange": "NSE",
+        "exchange": exchange,
         "industry": info.get("industry"),
         "sector": info.get("sector") or "—",
         "market_cap_cr": round(info["marketCap"] / 1e7, 1) if info.get("marketCap") else None,
@@ -330,7 +352,7 @@ def get_live_stock_data(symbol: str) -> dict | None:
     }
 
 
-# yfinance sector labels -> our curated NIFTY50 sector labels
+# yfinance sector labels -> NSE's own industry labels (index_members.industry)
 _SECTOR_TRANSLATE = {
     "Technology": "IT",
     "Consumer Defensive": "FMCG",
@@ -346,19 +368,20 @@ def get_sector_peers(symbol: str, yf_sector: str | None, metric: str = "return_6
     """
     Same-sector peers vs the analysed stock, compared on 6-month return.
 
-    Peers are drawn from the curated NIFTY 50 sector map; returns are computed
+    Peers are drawn from NSE index membership (index_members); returns are computed
     live from a small yfinance batch. Returns a DataFrame [symbol, <metric>]
     (empty if the sector can't be resolved).
     """
     import pandas as pd
-    from services.nifty50 import NIFTY50
+    from services.constituents import sector_map
+    sectors = sector_map()
 
     sym = symbol.strip().upper()
-    curated = NIFTY50.get(sym) or _SECTOR_TRANSLATE.get(yf_sector or "", yf_sector or "")
+    curated = sectors.get(sym) or _SECTOR_TRANSLATE.get(yf_sector or "", yf_sector or "")
     if not curated:
         return pd.DataFrame()
 
-    peers = [s for s, sec in NIFTY50.items() if sec == curated and s != sym]
+    peers = [s for s, sec in sectors.items() if sec == curated and s != sym]
     peers = peers[:6]
     if sym not in peers:
         peers.append(sym)

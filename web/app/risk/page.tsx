@@ -10,14 +10,23 @@ import { Donut, HBars } from "@/components/ui/chart";
 import { portfolioSummary, sectorAllocation, RawHolding } from "@/lib/portfolio";
 import { Stock } from "@/lib/data";
 import { useApi } from "@/lib/use-api";
+import { useLivePrices, withLivePrices } from "@/lib/use-live-prices";
+import { POLL } from "@/lib/poll";
+
+type RiskMetrics = {
+  volatilityAnnualPct?: number; var95Pct?: number; var95Value?: number;
+  maxDrawdownPct?: number; observations?: number;
+};
 import { compactCr, pct } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const authorize = () => window.dispatchEvent(new Event("artha:authorize"));
 
 export default function Risk() {
-  const universe = useApi<Stock[]>("/api/universe", [], (j) => j.items);
-  const holdings = useApi<RawHolding[]>("/api/holdings", [], (j) => j.items ?? []);
+  const universeRaw = useApi<Stock[]>("/api/universe", [], (j) => j.items, POLL.universe);
+  const holdings = useApi<RawHolding[]>("/api/holdings", [], (j) => j.items ?? [], POLL.holdings);
+  const live = useLivePrices(holdings.map((h) => h.symbol));
+  const universe = withLivePrices(universeRaw, live);
   const pf = portfolioSummary(holdings, universe);
   const alloc = sectorAllocation(holdings, universe);
 
@@ -35,17 +44,42 @@ export default function Risk() {
 
   const top = [...pf.rows].sort((a, b) => b.current - a.current)[0];
   const concentration = (top.current / pf.current) * 100;
-  // Factor metrics need per-holding return history (no feed wired) — shown as
-  // estimates from portfolio value, not a risk engine. Flagged in the UI.
-  const beta = 1.06;
-  const var95 = pf.current * 0.021;
+  // Real risk metrics computed from the portfolio's actual daily value series
+  // (holdings x historical closes). Previously beta was the literal constant
+  // 1.06, VaR was value x 2.1%, volatility 16.8, Sharpe 1.42 and max drawdown
+  // "-14.2%" — every one of them hardcoded, on a page about real money.
+  const curveApi = useApi<{ metrics: RiskMetrics; covered: number; total: number }>(
+    "/api/portfolio/curve", { metrics: {}, covered: 0, total: 0 }, (j) => j, POLL.curve
+  );
+  const m = curveApi.metrics ?? {};
+  const var95 = m.var95Value ?? null;
+
+  // Composite from real signals only; null when there's no history to judge on.
+  const riskScore = (() => {
+    if (!m.volatilityAnnualPct && !m.maxDrawdownPct) return null;
+    let r = 0;
+    r += Math.min(4, concentration / 10);                       // position concentration
+    r += Math.min(3, (m.volatilityAnnualPct ?? 0) / 10);        // realised volatility
+    r += Math.min(3, Math.abs(m.maxDrawdownPct ?? 0) / 10);     // drawdown depth
+    return +Math.min(10, r).toFixed(1);
+  })();
+  const riskLabel = riskScore == null ? "Not enough history"
+    : riskScore >= 7 ? "Elevated" : riskScore >= 4 ? "Moderate" : "Contained";
+  const riskSummary = riskScore == null
+    ? "Risk needs at least 20 days of portfolio value history to compute."
+    : `Top position is ${concentration.toFixed(0)}% of the book`
+      + (m.volatilityAnnualPct ? `, realised volatility ${m.volatilityAnnualPct.toFixed(1)}%` : "")
+      + (m.maxDrawdownPct ? `, worst drawdown ${m.maxDrawdownPct.toFixed(1)}%` : "") + ".";
 
   const flags = [
     { name: "Concentration Risk", detail: `${top.symbol} is ${concentration.toFixed(0)}% of book`, sev: concentration > 25 ? "warn" : "pass" },
     { name: "Sector Overexposure", detail: `${alloc[0].name} at ${alloc[0].value.toFixed(0)}%`, sev: alloc[0].value > 40 ? "fail" : alloc[0].value > 30 ? "warn" : "pass" },
-    { name: "Portfolio Beta", detail: `${beta} vs Nifty — market-like`, sev: beta > 1.3 ? "warn" : "pass" },
-    { name: "Drawdown Buffer", detail: "Max historical DD -14.2%", sev: "pass" },
-    { name: "Liquidity", detail: "All holdings large/mid-cap", sev: "pass" },
+    { name: "Volatility", detail: m.volatilityAnnualPct != null ? `${m.volatilityAnnualPct.toFixed(1)}% annualised` : "no history yet",
+      sev: (m.volatilityAnnualPct ?? 0) > 30 ? "warn" : "pass" },
+    { name: "Drawdown", detail: m.maxDrawdownPct != null ? `Worst peak-to-trough ${m.maxDrawdownPct.toFixed(1)}%` : "no history yet",
+      sev: Math.abs(m.maxDrawdownPct ?? 0) > 20 ? "warn" : "pass" },
+    { name: "History Coverage", detail: `${curveApi.covered}/${curveApi.total} holdings have price history`,
+      sev: curveApi.covered < curveApi.total ? "warn" : "pass" },
   ] as const;
   const tone = { pass: "up", warn: "warn", fail: "down" } as const;
 
@@ -57,21 +91,22 @@ export default function Risk() {
 
       <div className="mb-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
         <Card variant="elevated" className="lg:col-span-2">
-          <CardHeader icon={<Gauge size={16} />} title="Risk Metrics" subtitle="VaR from live value · beta/vol/Sharpe are estimates (no risk-engine feed)" />
+          <CardHeader icon={<Gauge size={16} />} title="Risk Metrics"
+            subtitle={m.observations ? `Computed from ${m.observations} days of real portfolio value` : "Awaiting price history"} />
           <CardBody className="grid grid-cols-2 gap-6 sm:grid-cols-4">
-            <Stat label="Portfolio VaR (95%)" value={var95} prefix="₹" decimals={0} sub="1-day potential loss" />
-            <Stat label="Beta" value={beta} decimals={2} sub="vs Nifty 50" />
-            <Stat label="Volatility (ann.)" value={16.8} decimals={1} suffix="%" sub="Realised 90d" />
-            <Stat label="Sharpe" value={1.42} decimals={2} sub="Risk-adjusted return" />
+            <Stat label="Portfolio VaR (95%)" value={var95} prefix="₹" decimals={0} sub="worst 1-day loss, 95% of days" />
+            <Stat label="Volatility (ann.)" value={m.volatilityAnnualPct ?? null} decimals={1} suffix="%" sub="realised, annualised" />
+            <Stat label="Max Drawdown" value={m.maxDrawdownPct ?? null} decimals={1} suffix="%" sub="peak to trough" />
+            <Stat label="Worst Day" value={m.var95Pct ?? null} decimals={2} suffix="%" sub="5th percentile daily return" />
           </CardBody>
         </Card>
         <Card variant="ai">
           <CardHeader icon={<Sparkles size={16} className="text-ai" />} title="Overall Risk" subtitle="AI composite" />
           <CardBody className="flex items-center gap-5">
-            <ScoreRing value={6.8} label="Risk" size={84} />
+            <ScoreRing value={riskScore} label="Risk" size={84} />
             <div className="text-[12.5px]">
-              <div className="font-semibold text-frost">Moderate</div>
-              <p className="mt-1 text-muted">Well-diversified with a manageable concentration tilt. No high-severity flags.</p>
+              <div className="font-semibold text-frost">{riskLabel}</div>
+              <p className="mt-1 text-muted">{riskSummary}</p>
             </div>
           </CardBody>
         </Card>

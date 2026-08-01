@@ -1,110 +1,258 @@
 "use client";
 import { useState } from "react";
-import { LineChart, Gauge, Target, Activity } from "lucide-react";
+import Link from "next/link";
+import { LineChart, Activity, Gauge, ArrowUpRight } from "lucide-react";
 import { PageHeader } from "@/components/widgets/page-header";
 import { Card, CardHeader, CardBody } from "@/components/ui/card";
-import { Stat, ScoreRing } from "@/components/ui/stat";
+import { Stat } from "@/components/ui/stat";
 import { Segmented, LiveDot, EmptyState } from "@/components/ui/primitives";
 import { Badge } from "@/components/ui/badge";
-import { HBars } from "@/components/ui/chart";
-import { CandleChart } from "@/components/ui/candles";
-import { OptionChain } from "@/components/widgets/option-chain";
+import { TIMEFRAME_DAYS, type Timeframe } from "@/components/ui/candles";
+import { KlineChart } from "@/components/widgets/kline-chart";
+import { LevelLadder, KIND_COLOR, type Zone, type Structure } from "@/components/widgets/level-ladder";
+import { PositionsPanel, usePositions, strikeOf } from "@/components/widgets/positions-panel";
 import { FnoNarrative } from "@/components/widgets/fno-narrative";
 import { useApi } from "@/lib/use-api";
-import { compactCr } from "@/lib/format";
-import { candles } from "@/lib/data";
+import { POLL } from "@/lib/poll";
+import { num, trendClass } from "@/lib/format";
+import { cn } from "@/lib/utils";
+
+// "What is the market doing?" — index structure and the decision surface.
+// The option chain deliberately does NOT render here; it lives on /options and
+// this page links to it (R1). Nothing on this page is duplicated there (R2).
 
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"];
+// The service key each switcher value resolves to, so the page can tell the
+// payload it asked for from the one still on screen.
+const INDEX_KEY: Record<string, string> = { NIFTY: "nifty50", BANKNIFTY: "banknifty", SENSEX: "sensex" };
 
-type OCRow = { strike: number; call: { oi: number; oiChg: number; vol: number; iv: number; ltp: number }; put: { oi: number; oiChg: number; vol: number; iv: number; ltp: number } };
+type Candle = { t: string; open: number; high: number; low: number; close: number; volume: number };
+type Leg = { oi: number; oiChg: number; vol: number; iv: number; ltp: number; delta: number | null; buildup: string | null };
+type OCRow = { strike: number; call: Leg; put: Leg };
+type Quad = { legs: number; oi_change: number };
+type BuildupSummary = {
+  call: Record<string, Quad | undefined>;
+  put: Record<string, Quad | undefined>;
+  unclassified?: { call: number; put: number };
+  basis?: string | null;
+};
 type Plan = {
-  ok: boolean; spot: number; atm: number; pcr: number; maxPain: number; iv: number; vix: number | null;
+  ok: boolean; index: string; name: string; spot: number; atm: number; pcr: number; maxPain: number; iv: number; vix: number | null;
+  vixPctile: number | null; vixWindow: number; vixAsOf: string | null;
   callWall: number | null; putWall: number | null; biasLabel: string | null; biasScore: number | null;
-  strategy: string | null; strategyNote: string | null; levels: { label: string; price: number; kind: string }[]; rows: OCRow[];
+  expiry: string | null;
+  levels: { label: string; price: number; kind: string; crossed: boolean }[];
+  zones: Zone[]; structure: Structure | null;
+  buildupSummary: BuildupSummary | null; buildupBasis: string | null;
+  rows: OCRow[];
 };
 
-const KIND_COLOR: Record<string, string> = { resistance: "#f4586a", support: "#10b981", pivot: "#f5a623", call_wall: "#f4586a", put_wall: "#10b981" };
+// The four standard OI build-up quadrants (price change x OI change). These
+// describe what the OI did — they are not instructions.
+const QUADRANTS = [
+  { key: "long_buildup", label: "Long build-up", hint: "price up · OI up" },
+  { key: "short_buildup", label: "Short build-up", hint: "price down · OI up" },
+  { key: "short_covering", label: "Short covering", hint: "price up · OI down" },
+  { key: "long_unwinding", label: "Long unwinding", hint: "price down · OI down" },
+] as const;
+
+const QUAD_LABEL: Record<string, string> = Object.fromEntries(QUADRANTS.map((q) => [q.key, q.label]));
+
+// Open interest is quoted in lakh of contracts across the desk. A missing
+// measurement is an em dash, never 0 (R17).
+const lakh = (n: number | null | undefined) =>
+  typeof n === "number" && Number.isFinite(n) ? `${n >= 0 ? "+" : "−"}${(Math.abs(n) / 1e5).toFixed(1)}L` : "—";
+
+const ordinal = (n: number) => {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
+};
 
 export default function FnO() {
   const [idx, setIdx] = useState("NIFTY");
-  const live = useApi<Plan | null>(`/api/fno/${idx}`, null, (j) => (j.ok ? j : null));
+  const [tf, setTf] = useState<Timeframe>("1Y");
+  const live = useApi<Plan | null>(`/api/fno/${idx}`, null, (j) => (j.ok ? j : null), POLL.fno);
+  const candles = useApi<Candle[]>(`/api/history?symbols=${idx}&days=${TIMEFRAME_DAYS[tf]}&ohlc=1`, [], (j) => j.candles ?? [], POLL.history);
+  const book = usePositions();
 
   const header = (
-    <PageHeader eyebrow="Derivatives" title="F&O Analysis"
-      description="Institutional derivatives workspace — OI structure, PCR, max pain, and levels from the live option chain."
+    <PageHeader eyebrow="Derivatives" title="F&O · Market Structure"
+      description="What the market is doing: the level map, where open interest moved, and volatility context. The strike-by-strike chain lives on Options."
       actions={<><Segmented value={idx} onChange={setIdx} options={INDICES.map((v) => ({ label: v, value: v }))} /><LiveDot label={live ? "LIVE" : "NO DATA"} /></>} />
   );
 
-  if (!live) {
+  // useApi keeps the previous payload until the next one lands, and a cold chain
+  // fetch for a newly-selected index takes 10-20s. Rendering NIFTY levels under
+  // a BANKNIFTY heading would be a fabricated read of a market nobody asked
+  // about, so gate on the payload naming the index that is selected.
+  if (!live || live.index !== INDEX_KEY[idx]) {
     return (
       <div>
         {header}
-        <Card><CardBody><EmptyState icon={<Activity size={22} />} title={`No live option chain for ${idx}`}
-          description="Upstox may be unauthenticated, outside market hours, or unreachable." /></CardBody></Card>
+        <Card><CardBody><EmptyState icon={<Activity size={22} />}
+          title={live ? `Loading the ${idx} chain…` : `No live option chain for ${idx}`}
+          description={live
+            ? "Pulling the option chain and rebuilding the level map for this index."
+            : "Upstox may be unauthenticated, outside market hours, or unreachable."} /></CardBody></Card>
       </div>
     );
   }
 
-  const { spot, atm, rows, pcr, maxPain, iv: atmIv } = live;
-  const totalCallOI = rows.reduce((a, r) => a + r.call.oi, 0);
-  const totalPutOI = rows.reduce((a, r) => a + r.put.oi, 0);
-  const levels = live.levels.map((l) => ({ price: Math.round(l.price), label: l.label, color: KIND_COLOR[l.kind] ?? "#f5a623" }));
-  const oiData = rows.map((r) => ({ name: String(r.strike), value: r.put.oi - r.call.oi }));
-  // No per-index intraday OHLC feed is served yet — render deterministic candle
-  // geometry seeded on the LIVE spot so the chart shows candlesticks (not just
-  // level lines), with the real call/put walls & max-pain overlaid.
-  const chartBars = spot ? candles(idx.length + Math.round(spot), 90, spot) : [];
+  const { spot, atm, rows, pcr, maxPain, zones, structure } = live;
+
+  // One mapping, straight from the confluence engine — the chart and the ladder
+  // draw the same zones in the same colours, with `crossed` marking the broken
+  // ones and `basis` carried through verbatim into the chart tooltip (R4/R18).
+  const chartLevels = zones.map((z) => ({
+    price: z.price, lo: z.lo, hi: z.hi,
+    label: z.members.map((m) => m.label).join(" + "),
+    color: KIND_COLOR[z.kind] ?? "#f5a623",
+    kind: z.kind, crossed: z.crossed, strength: z.strength, basis: z.basis, state: z.state,
+  }));
+
+  // Open contracts pinned onto the ladder at the strike parsed from their name.
+  const markers = (book?.items ?? [])
+    .map((p) => ({ price: strikeOf(p.symbol), label: p.symbol }))
+    .filter((m): m is { price: number; label: string } => m.price != null);
+
+  // R13/R17: a percentile of a short window is not a percentile. Say which of
+  // the three states this is instead of printing a bare dash.
+  const vixSub = live.vix == null
+    ? "India VIX unavailable this session"
+    : live.vixPctile != null
+      ? `${ordinal(Math.round(live.vixPctile))} percentile of ${live.vixWindow} sessions${live.vixAsOf ? ` · to ${live.vixAsOf}` : ""}`
+      : live.vixWindow >= 60
+        ? `percentile unavailable for this reading (${live.vixWindow} sessions stored)`
+        : `percentile unavailable — ${live.vixWindow} of the 60 sessions needed are stored`;
+
+  const bu = live.buildupSummary;
+  const movers = rows
+    .flatMap((r) => [
+      { strike: r.strike, side: "CALL" as const, oiChg: r.call.oiChg, buildup: r.call.buildup },
+      { strike: r.strike, side: "PUT" as const, oiChg: r.put.oiChg, buildup: r.put.buildup },
+    ])
+    .sort((a, b) => Math.abs(b.oiChg) - Math.abs(a.oiChg))
+    .slice(0, 6);
+
+  const quadCell = (side: "call" | "put", q: typeof QUADRANTS[number]) => {
+    const cell = bu?.[side]?.[q.key];
+    return (
+      <div key={q.key} className="rounded-[var(--radius-sm)] bg-void p-3 hairline">
+        <div className="text-[11px] font-medium text-mist">{q.label}</div>
+        <div className="mt-1 flex items-baseline gap-1.5">
+          <span className="text-[18px] font-semibold text-frost tnum">{cell ? cell.legs : "—"}</span>
+          <span className="text-[10.5px] text-muted">strikes</span>
+        </div>
+        {/* no legs in this quadrant is not an OI move of zero — print nothing to measure */}
+        <div className={cn("text-[11.5px] tnum", trendClass(cell?.legs ? cell.oi_change : null))}>
+          {cell?.legs ? lakh(cell.oi_change) : "—"} OI
+        </div>
+        <div className="mt-0.5 text-[10px] text-faint">{q.hint}</div>
+      </div>
+    );
+  };
 
   return (
     <div>
       {header}
 
-      {/* Metrics */}
+      {/* Metrics — index-level context only. Per-strike microstructure is on /options. */}
       <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-6">
-        <Card className="p-4"><Stat label="Spot" value={spot} decimals={0} /></Card>
+        <Card className="p-4"><Stat label="Spot" value={spot} decimals={2} sub={live.expiry ? `expiry ${live.expiry}` : undefined} /></Card>
         <Card className="p-4"><Stat label="ATM Strike" value={atm} decimals={0} /></Card>
-        <Card className="p-4"><div className="flex items-center justify-between"><Stat label="PCR" value={pcr} decimals={2} /><Badge tone={pcr > 1 ? "up" : "down"}>{pcr > 1 ? "Bullish" : "Bearish"}</Badge></div></Card>
+        <Card className="p-4"><Stat label="PCR (OI)" value={pcr} decimals={2} sub={live.biasLabel ?? undefined} /></Card>
         <Card className="p-4"><Stat label="Max Pain" value={maxPain} decimals={0} /></Card>
-        <Card className="p-4"><Stat label="Call OI" value={totalCallOI / 1e5} decimals={1} suffix="L" /></Card>
-        <Card className="p-4"><Stat label="Put OI" value={totalPutOI / 1e5} decimals={1} suffix="L" /></Card>
+        <Card className="p-4 xl:col-span-2"><Stat label="India VIX" value={live.vix} decimals={2} sub={vixSub} /></Card>
+      </div>
+
+      {/* Chart + ladder are the centre of the page. */}
+      <Card className="mb-6">
+        <CardHeader icon={<LineChart size={16} />} title={`${idx} · price against the level map`}
+          subtitle="Wheel or pinch to zoom, drag to pan. A level price traded through is drawn broken; each level's basis is spelled out in the map below."
+          action={structure?.signal ? <Badge tone="neutral">{zones.length} zones</Badge> : null} />
+        <CardBody className="pt-0">
+          {candles.length > 0
+            ? <KlineChart symbol={idx} liveKey={live.index} data={candles} levels={chartLevels} spot={spot} height={440} timeframe={tf} onTimeframe={setTf} />
+            : <p className="py-10 text-center text-[12.5px] text-muted">No daily index history stored for {idx}.</p>}
+        </CardBody>
+      </Card>
+
+      <div className="mb-6">
+        <LevelLadder zones={zones} spot={spot} structure={structure} markers={markers} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
         <Card className="xl:col-span-2">
-          <CardHeader icon={<LineChart size={16} />} title={`${idx} · Derivative Levels`} subtitle="Call/put walls & max pain from the live chain" />
-          <CardBody className="pt-0">
-            {chartBars.length > 0
-              ? <CandleChart data={chartBars} levels={levels} height={340} />
-              : <p className="py-10 text-center text-[12.5px] text-muted">No spot price in the current plan.</p>}
+          <CardHeader icon={<Gauge size={16} />} title="OI Build-Up"
+            subtitle="Each leg classified by its own price change against its open-interest change"
+            action={bu?.basis ? <Badge tone="neutral">basis · {bu.basis}</Badge> : null} />
+          <CardBody className="pt-0 space-y-4">
+            {!bu ? (
+              <p className="py-6 text-center text-[12.5px] text-muted">No build-up classification for this session.</p>
+            ) : (
+              <>
+                <div className="grid gap-4 md:grid-cols-2">
+                  {(["call", "put"] as const).map((side) => (
+                    <div key={side}>
+                      <div className="mb-2 flex items-center gap-2">
+                        <span className={cn("text-[11px] font-semibold uppercase tracking-wide", side === "call" ? "text-down" : "text-up")}>
+                          {side === "call" ? "Calls" : "Puts"}
+                        </span>
+                        {bu.unclassified && (
+                          <span className="text-[10.5px] text-faint">{bu.unclassified[side]} legs flat, not classified</span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">{QUADRANTS.map((q) => quadCell(side, q))}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div>
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">Biggest OI moves this session</div>
+                  <ul className="divide-y divide-line overflow-hidden rounded-[var(--radius-sm)] hairline">
+                    {movers.map((m) => (
+                      <li key={`${m.strike}-${m.side}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-[12px]">
+                        <span className="font-semibold text-frost tnum">{num(m.strike, { decimals: 0 })}</span>
+                        <Badge tone={m.side === "CALL" ? "down" : "up"}>{m.side}</Badge>
+                        <span className={cn("tnum", trendClass(m.oiChg))}>{lakh(m.oiChg)} OI</span>
+                        <span className="ml-auto text-[11px] text-mist">{m.buildup ? QUAD_LABEL[m.buildup] ?? m.buildup : "—"}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <p className="text-[11px] leading-snug text-faint">
+                  Classification basis: <span className="text-muted">{live.buildupBasis ?? "unavailable"}</span> — each leg&apos;s own
+                  change against its prior close, paired with its open-interest change. A leg whose price or OI did not
+                  move is left unclassified rather than assigned a quadrant.
+                </p>
+              </>
+            )}
           </CardBody>
         </Card>
 
         <div className="space-y-6">
-          <Card>
-            <CardHeader icon={<Gauge size={16} />} title="Sentiment Gauge" subtitle={live.biasLabel ?? "Options-implied bias"} />
-            <CardBody className="flex items-center gap-5">
-              <ScoreRing value={live.biasScore != null ? live.biasScore / 10 : 0} label="Bias" />
-              <div className="space-y-2 text-[12.5px]">
-                <div className="flex justify-between gap-6"><span className="text-muted">IV (ATM)</span><span className="font-semibold text-frost tnum">{atmIv}%</span></div>
-                <div className="flex justify-between gap-6"><span className="text-muted">India VIX</span><span className="font-semibold text-frost tnum">{live.vix ?? "—"}</span></div>
-                <div className="flex justify-between gap-6"><span className="text-muted">Strategy</span><span className="font-semibold text-warn text-right">{live.strategy ?? "—"}</span></div>
+          <PositionsPanel book={book} />
+
+          <Card interactive>
+            <Link href={`/options?index=${idx}${live.expiry ? `&expiry=${live.expiry}` : ""}`} className="block px-5 py-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-[13px] font-semibold text-frost">Full option chain</h3>
+                  <p className="mt-1 text-[11.5px] leading-snug text-muted">
+                    Strike-by-strike OI, IV, Δ and the volatility surface for {idx}
+                    {live.expiry ? ` · ${live.expiry}` : ""} — on the Options page, the one place the chain renders.
+                  </p>
+                </div>
+                <ArrowUpRight size={16} className="mt-0.5 shrink-0 text-accent" />
               </div>
-            </CardBody>
-          </Card>
-          <Card>
-            <CardHeader icon={<Target size={16} />} title="OI Profile" subtitle="Put − Call OI by strike" />
-            <CardBody><HBars data={oiData} height={260} fmt={(v) => compactCr(v)} /></CardBody>
+            </Link>
           </Card>
         </div>
       </div>
 
       <div className="mt-6">
-        <FnoNarrative idx={idx} />
-      </div>
-
-      <div className="mt-6">
-        <h3 className="mb-3 flex items-center gap-2 text-[15px] font-semibold text-frost"><Activity size={16} className="text-muted" />Option Chain · {idx}</h3>
-        <OptionChain spot={spot} seed={idx.length} data={{ atm, rows }} />
+        <FnoNarrative idx={idx} source="oi-read" />
       </div>
     </div>
   );

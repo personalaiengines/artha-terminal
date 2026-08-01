@@ -22,7 +22,11 @@ INDEX_KEYS = {
     "nifty50": "NSE_INDEX|Nifty 50",
     "banknifty": "NSE_INDEX|Nifty Bank",
     "sensex": "BSE_INDEX|SENSEX",
-    "niftymidcap": "NSE_INDEX|Nifty Midcap 150",
+    # "Nifty Midcap 150" is not a valid Upstox instrument key — the quotes
+    # endpoint silently omits unknown keys, so this index has always come
+    # back empty. "Nifty Midcap 50" is the real key (and maps cleanly to
+    # Yahoo's ^NSEMDCP50 for the fallback path).
+    "niftymidcap": "NSE_INDEX|Nifty Midcap 50",
     "indiavix": "NSE_INDEX|India VIX",
 }
 
@@ -43,6 +47,49 @@ def _num(v):
         return None
 
 
+def _quote_change(v: dict) -> tuple[float | None, float | None, float | None]:
+    """(last_price, previous_close, change_pct) from one Upstox quote record.
+
+    `ohlc.close` is ambiguous: during the session it is the PREVIOUS day's
+    close, but once the session settles it becomes TODAY's close — identical to
+    last_price. Both quote endpoints used to handle that second case by falling
+    back to `(last - open) / open`, which is the intraday move from the opening
+    print, not the day's change. That is why the terminal showed Nifty +14.11
+    (23985.35 vs its 23971.25 open) on a day it actually closed 10.60 points
+    DOWN against the prior close.
+
+    `net_change` is Upstox's own day change in points and is unambiguous in
+    both states, so derive the previous close from it and only fall back to
+    ohlc.close while it still demonstrably differs from last_price.
+    """
+    ohlc = v.get("ohlc") or {}
+    last = _num(v.get("last_price"))
+    if last is None:
+        last = _num(ohlc.get("close"))
+    net = _num(v.get("net_change"))
+
+    if last is not None and net is not None:
+        prev = last - net
+        return last, prev, ((net / prev * 100) if prev else None)
+
+    prev = _num(ohlc.get("close"))
+    if last is not None and prev and last != prev:
+        return last, prev, (last - prev) / prev * 100
+    # No trustworthy previous close — report no change rather than a number
+    # measured against the wrong baseline.
+    return last, prev, None
+
+
+def _greek(v) -> float | None:
+    """
+    A greek Upstox printed as literally 0.0 is a thin-quote artifact, not a
+    measurement — SENSEX's nearest expiry returns iv 0.0 / delta 0.0 on live
+    ATM legs that carry real OI and volume. Report it as ABSENT so nothing
+    downstream renders a zero as if the leg had been priced.
+    """
+    return _num(v) or None
+
+
 def _parse_option_chain(raw: list[dict]) -> dict:
     """
     Normalise Upstox's /v2/option/chain response into a compact shape.
@@ -55,7 +102,8 @@ def _parse_option_chain(raw: list[dict]) -> dict:
           "spot": float | None,
           "strikes": [
              {"strike": float,
-              "call": {"ltp","oi","prev_oi","oi_change","iv","volume","delta"},
+              "call": {"ltp","oi","prev_oi","prev_close","oi_change",
+                       "price_chg","iv","volume","delta"},
               "put":  {...same...}},
              ...  # sorted ascending by strike
           ],
@@ -75,14 +123,22 @@ def _parse_option_chain(raw: list[dict]) -> dict:
             gk = (side or {}).get("option_greeks", {}) or {}
             oi = _num(md.get("oi"))
             prev_oi = _num(md.get("prev_oi"))
+            ltp = _num(md.get("ltp"))
+            # Upstox pairs `close_price` with `prev_oi` — both are the PRIOR
+            # session's settled value for this leg. That is what makes an OI
+            # build-up quadrant classifiable per leg (price change × OI change)
+            # instead of proxied from the index move.
+            prev_close = _num(md.get("close_price"))
             return {
-                "ltp": _num(md.get("ltp")),
+                "ltp": ltp,
                 "oi": oi,
                 "prev_oi": prev_oi,
+                "prev_close": prev_close,
                 "oi_change": (oi - prev_oi) if (oi is not None and prev_oi is not None) else None,
-                "iv": _num(gk.get("iv")),
+                "price_chg": (ltp - prev_close) if (ltp is not None and prev_close is not None) else None,
+                "iv": _greek(gk.get("iv")),
                 "volume": _num(md.get("volume")),
-                "delta": _num(gk.get("delta")),
+                "delta": _greek(gk.get("delta")),
             }
 
         strikes.append({
@@ -96,9 +152,35 @@ def _parse_option_chain(raw: list[dict]) -> dict:
 
 
 def _equity_key(symbol: str, exchange: str = "NSE_EQ") -> str:
-    """Build an Upstox instrument key for an equity symbol."""
+    """Build an Upstox instrument key for an equity symbol.
+
+    Upstox addresses equities by ISIN, not ticker — its own holdings payload
+    returns `NSE_EQ|INE364U01010`. Building `NSE_EQ|ADANIGREEN` produced a 200
+    with an empty `data` map, so every equity quote call failed silently and
+    looked like "Upstox has no data outside market hours". Falls back to the
+    ticker form when the ISIN is unknown, which is still no worse than before.
+    """
     sym = symbol.upper().replace(" ", "")
-    return f"{exchange}|{sym}"
+    isin = _isin_for(sym)
+    return f"{exchange}|{isin or sym}"
+
+
+_isin_cache: dict[str, str] | None = None
+
+
+def _isin_for(symbol: str) -> str | None:
+    global _isin_cache
+    if _isin_cache is None:
+        try:
+            from db import get_connection
+            with get_connection() as conn:
+                _isin_cache = {
+                    r["symbol"]: r["isin"] for r in conn.execute(
+                        "SELECT symbol, isin FROM symbol_master WHERE isin IS NOT NULL AND isin != ''")
+                }
+        except Exception:
+            _isin_cache = {}
+    return _isin_cache.get(symbol)
 
 
 def _normalize_key(raw: str) -> str:
@@ -170,18 +252,10 @@ class UpstoxClient:
         for raw_key, v in data.items():
             sym = _normalize_key(raw_key)
             ohlc = v.get("ohlc", {}) or {}
-            last = v.get("last_price") or ohlc.get("close")
-            prev_close = ohlc.get("close")
-            open_ = ohlc.get("open")
-            change_pct = None
-            if last is not None and prev_close and prev_close != 0:
-                if last != prev_close:
-                    change_pct = (last - prev_close) / prev_close * 100
-                elif open_ and open_ != 0:
-                    change_pct = (last - open_) / open_ * 100
+            last, prev_close, change_pct = _quote_change(v)
             out[sym] = {
                 "last_price": last,
-                "open": open_,
+                "open": ohlc.get("open"),
                 "high": ohlc.get("high"),
                 "low": ohlc.get("low"),
                 "close": prev_close,
@@ -219,17 +293,9 @@ class UpstoxClient:
         for raw_key, v in data.items():
             sym = _normalize_key(raw_key)
             ohlc = v.get("ohlc", {}) or {}
-            last = v.get("last_price") or ohlc.get("close")
-            prev_close = ohlc.get("close")
-            open_ = ohlc.get("open")
-            change_pct = None
-            if last is not None and prev_close and prev_close != 0:
-                if last != prev_close:
-                    change_pct = (last - prev_close) / prev_close * 100
-                elif open_ and open_ != 0:
-                    change_pct = (last - open_) / open_ * 100
+            last, prev_close, change_pct = _quote_change(v)
             out[sym] = {
-                "last_price": last, "open": open_, "high": ohlc.get("high"),
+                "last_price": last, "open": ohlc.get("open"), "high": ohlc.get("high"),
                 "low": ohlc.get("low"), "close": prev_close,
                 "volume": v.get("volume"), "change_pct": change_pct,
             }
@@ -273,15 +339,7 @@ class UpstoxClient:
         for raw_key, v in data.items():
             name = friendly.get(raw_key.replace(":", "|")) or _normalize_key(raw_key)
             ohlc = v.get("ohlc", {}) or {}
-            last = v.get("last_price") or ohlc.get("close")
-            prev_close = ohlc.get("close")
-            open_ = ohlc.get("open")
-            change = None
-            if last is not None and prev_close and prev_close != 0:
-                if last != prev_close:
-                    change = (last - prev_close) / prev_close * 100
-                elif open_ and open_ != 0:
-                    change = (last - open_) / open_ * 100
+            last, _prev, change = _quote_change(v)
             out[name] = {
                 "value": last,
                 "change": change,
@@ -490,3 +548,55 @@ class UpstoxClient:
             return {"status": "ok", "data": r.json().get("data", []) or []}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+
+async def get_quote_with_fallback(instrument_key: str, max_staleness_seconds: float = 5.0) -> dict:
+    """
+    Live quote for one instrument: prefer the WebSocket tick cache
+    (services.upstox_stream) when fresh, fall back to REST otherwise.
+
+    On the REST fallback path only, cross-checks Upstox against Yahoo Finance
+    via engines.verification.VerificationMembrane (its first live caller) and
+    tags the result with "verified_status" (VERIFIED/SINGLE_SOURCE/CONFLICT/
+    None). Existing callers of get_quote()/get_quote_by_keys() are unaffected
+    — this is an additive, optional-key path, not a breaking change.
+    """
+    import time
+    from services.upstox_stream import get_stream_manager
+
+    tick = get_stream_manager().get_cached_tick(instrument_key)
+    if tick and tick.get("ltp") is not None and (time.time() - tick["received_at"]) < max_staleness_seconds:
+        return {"last_price": tick["ltp"], "close": tick.get("close"),
+                "source": "stream", "verified_status": None}
+
+    quote = await UpstoxClient().get_quote_by_keys([instrument_key])
+    upstox_val = next((v for v in quote.values() if v.get("last_price")), None)
+    if not upstox_val:
+        return {"last_price": None, "source": "rest", "verified_status": None}
+
+    consensus_price = upstox_val.get("last_price")
+    verified_status = None
+
+    # Yahoo only has an equivalent quote shape for equities (.NS/.BO), not
+    # index instrument keys — skip verification for indices rather than
+    # forcing a comparison that isn't meaningful.
+    if instrument_key.startswith(("NSE_EQ|", "BSE_EQ|")):
+        try:
+            import asyncio
+            from services.yahoo import YahooFinance
+            from engines.verification import VerificationMembrane
+
+            symbol = _normalize_key(instrument_key)
+            yahoo_quote = await asyncio.to_thread(YahooFinance().get_quote, symbol)
+            yahoo_price = (yahoo_quote or {}).get("current_price")
+            field = VerificationMembrane().verify_price(
+                upstox_price=upstox_val.get("last_price"), yahoo_price=yahoo_price, symbol=symbol,
+            )
+            verified_status = field.status.value
+            if field.consensus_value is not None:
+                consensus_price = field.consensus_value
+        except Exception:
+            pass
+
+    return {**upstox_val, "last_price": consensus_price, "source": "rest",
+            "verified_status": verified_status}

@@ -17,6 +17,7 @@ AI layer (clearly labelled, sourced):
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -54,7 +55,11 @@ def fetch_fii_dii() -> dict:
     }
     rows = None
     # NSE is flaky and cookie-gated — retry a couple of times with a fresh session.
-    for _ in range(3):
+    # Each attempt costs 3 requests (2 cookie warms + the call), so back off
+    # between attempts rather than bursting 9 requests at a rate-limiting host.
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2 ** attempt)
         try:
             with httpx.Client(headers=headers, timeout=15.0, follow_redirects=True) as c:
                 # Best-effort cookie seeding; these endpoints intermittently 403 or

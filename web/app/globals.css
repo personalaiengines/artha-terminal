@@ -161,3 +161,18 @@ body {
     scroll-behavior: auto !important;
   }
 }
+
+/* Live index ticker (components/widgets/india-indices.tsx). Pure CSS marquee:
+   the row is rendered twice and translated by exactly half its width, so the
+   loop is seamless without a rAF loop or a marquee dependency. The global
+   prefers-reduced-motion rule above freezes it. */
+@keyframes artha-marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.marquee-track {
+  display: flex;
+  width: max-content;
+  animation: artha-marquee 48s linear infinite;
+}
+.marquee:hover .marquee-track { animation-play-state: paused; }

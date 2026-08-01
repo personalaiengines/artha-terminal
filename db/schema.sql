@@ -52,6 +52,29 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 );
 
 -- ============================================
+-- Table: prices_intraday
+-- 1-MINUTE bars only. Coarser resolutions (5m/15m/1h) are resampled from these
+-- at read time in services/intraday.py — Upstox hard-rejects those intervals
+-- (HTTP 400 UDAPI1020: "Interval accepts one of (1minute,30minute,day,week,
+-- month)"), so they can never be fetched, only computed.
+--
+-- `ts` is Unix SECONDS, UTC, and is the bar's OPEN time.
+-- No FK to symbol_master on purpose: the F&O indices (NIFTY/BANKNIFTY/SENSEX)
+-- are not instruments in symbol_master, and a FK would reject every row.
+-- ============================================
+CREATE TABLE IF NOT EXISTS prices_intraday (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume INTEGER,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_intraday_symbol_ts ON prices_intraday(symbol, ts);
+
+-- ============================================
 -- Table: fii_dii_flows
 -- Daily FII/DII net cash-market flows (NSE), accumulated for trend
 -- ============================================
@@ -200,7 +223,7 @@ CREATE TABLE IF NOT EXISTS computed_metrics (
 CREATE TABLE IF NOT EXISTS agent_cache (
     key TEXT PRIMARY KEY,
     symbol TEXT NOT NULL REFERENCES symbol_master(symbol),
-    analysis_type TEXT CHECK(analysis_type IN ('deep_dive', 'swot', 'verdict', 'sector_outlook', 'red_flags')) NOT NULL,
+    analysis_type TEXT CHECK(analysis_type IN ('deep_dive', 'swot', 'verdict', 'sector_outlook', 'red_flags', 'market_news')) NOT NULL,
     content_json TEXT NOT NULL,  -- Serialized LLM output
     model_used TEXT,
     tokens_used INTEGER,
@@ -225,7 +248,7 @@ CREATE TABLE IF NOT EXISTS search_cache (
     sector TEXT,
     symbol TEXT,
     results_json TEXT NOT NULL,
-    source TEXT CHECK(source IN ('serpapi', 'searxng', 'jina')) NOT NULL,
+    source TEXT CHECK(source IN ('serpapi', 'searxng', 'jina', 'finnhub')) NOT NULL,
     cache_at TEXT NOT NULL,
     ttl_hours INTEGER NOT NULL,
     expires_at TEXT NOT NULL,
@@ -249,6 +272,31 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ingestion_runs_job_started ON ingestion_runs(job_id, started_at DESC);
+
+-- Last known-good payload per feed, so a failed upstream serves real (dated)
+-- data instead of nothing. Survives restarts, which the in-process TTL cache
+-- does not — a cold start after a container restart was the one case where a
+-- transient upstream failure left a panel with no data at all.
+CREATE TABLE IF NOT EXISTS last_good (
+    key          TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    saved_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Index membership (NIFTY 50, Bank Nifty, sector indices …), ingested from the
+-- official NSE constituent CSVs. Previously these lists were literals in
+-- services/nifty50.py, which drifted the moment NSE rejigged an index — the
+-- hardcoded Bank Nifty was already missing UNIONBANK and YESBANK.
+-- `industry` is NSE's own sector label for the stock, from the same CSV.
+CREATE TABLE IF NOT EXISTS index_members (
+    index_key   TEXT NOT NULL,
+    index_name  TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    industry    TEXT,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (index_key, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_index_members_symbol ON index_members(symbol);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,6 +337,39 @@ CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache(expires_at);
 -- Audit log queries
 CREATE INDEX IF NOT EXISTS idx_audit_log_type ON audit_log(event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
+
+-- ============================================
+-- User Data: Alerts + Watchlists
+-- ============================================
+-- These three were created inline by the API handlers (_ensure_alerts /
+-- _ensure_watchlists in api/server.py), so a fresh database only grew them
+-- once someone hit the matching route. They belong here with the rest of the
+-- schema; init_database() re-runs this file on every start and every statement
+-- is IF NOT EXISTS, so this is a no-op on a database that already has them.
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    type TEXT NOT NULL,
+    condition TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS watchlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The ON DELETE CASCADE only fires on a connection that has
+-- PRAGMA foreign_keys=ON; api/server.py's watchlists_delete sets it per-call.
+CREATE TABLE IF NOT EXISTS watchlist_items (
+    list_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+    added TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (list_id, symbol)
+);
 
 -- ============================================
 -- Triggers for Auto-update

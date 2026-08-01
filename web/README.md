@@ -2,7 +2,8 @@
 
 Ground-up redesign of the ARTHA Terminal front end as a premium, AI-native
 institutional research workspace. Next.js 15 · React 19 · Tailwind v4 ·
-Framer Motion · Recharts. One design system, 15 pages, every screen inherits it.
+Framer Motion · Recharts · KLineChart. One design system, 16 pages, every screen
+inherits it.
 
 ## Run
 
@@ -72,9 +73,10 @@ the deterministic mock ([`lib/data.ts`](lib/data.ts)).
 
 Live now: equity universe (DB — real price/volume/RSI/52w/history), single-stock research,
 market news (category-tagged), macro calendar, market breadth/sectors, FII/DII flows,
-world board, **grounded AI Analyst** (`/api/ai`) and **AI Market Brief** (`/api/brief`).
-Still geometry-only (no live feed): options-chain OI, F&O candlestick shape (drawn around
-the real spot with real walls/max-pain overlaid).
+world board, **grounded AI Analyst** (`/api/ai`), **AI Market Brief** (`/api/brief`),
+the full **option chain** (live OI/IV/greeks per strike) and the **F&O chart** — real
+daily and intraday candles from `/api/history` and `/api/udf/history`, with live ticks
+folded into the forming bar. Nothing on the F&O page is geometry any more.
 
 **Null-safety:** the live API returns `null` for DB gaps (price, changePct, P/E…). All
 formatters ([`lib/format.ts`](lib/format.ts)) and numeric UI primitives
@@ -84,17 +86,38 @@ formatters ([`lib/format.ts`](lib/format.ts)) and numeric UI primitives
 
 `ARTHA_API_URL` points at the API (`http://api:8000` in Docker, `http://localhost:8000` in dev).
 
+`NEXT_PUBLIC_ARTHA_WS_URL` (browser-visible) points the live-tick WebSocket client
+([`lib/use-ws.ts`](lib/use-ws.ts)) at the API's `/ws` endpoint. Defaults to
+`ws://<current-hostname>:8000/ws` if unset, which covers plain `npm run dev` and any
+host reachable on port 8000 without configuration. Note: `NEXT_PUBLIC_*` vars are inlined
+at `next build` time — a Docker deployment on a different API host needs this passed as a
+build arg, not just a container `environment:` entry.
+
 ## Deliberate scope cuts (v1)
 
-- **No TanStack Table / React Query / Zustand.** Rows are static mock data, so a
-  data-fetch and global-state layer has nothing to do yet. `components/ui/data-grid.tsx`
-  is a hand-rolled sortable grid; `ui-store.tsx` is React context. Add the libraries
-  when the backend wires up (server sort/filter, thousands of rows, live quotes).
-- **Candlestick is custom SVG**, not a charting lib — full control of the dark
-  aesthetic, crosshair, and level overlays in ~150 lines.
+- **No TanStack Table / React Query / Zustand.** `lib/use-api.ts` is ~60 lines of
+  poll-and-swap and covers every page; `components/ui/data-grid.tsx` is a hand-rolled
+  sortable grid; `ui-store.tsx` is React context. Add the libraries when the shape of
+  the problem needs them (server-side sort/filter, tens of thousands of rows).
+- **Two chart engines, on purpose.** `components/ui/candles.tsx` is a ~150-line custom
+  SVG candlestick for the stock research page — full control of the dark aesthetic in
+  less code than configuring a library. The F&O chart
+  ([`components/widgets/kline-chart.tsx`](components/widgets/kline-chart.tsx)) is
+  KLineChart, because that page needs drawing tools, an indicator set and tick-level
+  streaming, and hand-rolling those is a project, not a component.
+- **No test runner.** The non-trivial pure logic (`lib/indicators.ts`, `lib/live-bar.ts`,
+  `lib/chart-store.ts`) carries `assert`-based self-checks run through the installed
+  `tsc` — see the root README's Tests section. Add a runner when there is something
+  to test that these cannot reach.
 
 ## Accessibility & sessions
 
 WCAG-minded contrast, `:focus-visible` rings on every interactive element,
 `prefers-reduced-motion` honored globally, keyboard-driven command palette (⌘K),
 tabular numbers on all financial data, dark low-fatigue palette for long sessions.
+
+The F&O chart is the hard case: a `<canvas>` is invisible to a screen reader and
+unreachable by Tab. It is `role="application"` and focusable, with arrow keys
+walking a read cursor bar by bar and announcing each stop through `aria-live` —
+OHLC plus the nearest level and the distance to it. Full keyboard control of
+resolution, zoom, level filtering and expansion; `?` lists the shortcuts.

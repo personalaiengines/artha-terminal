@@ -7,18 +7,21 @@ __pycache__/
 venv/
 env/
 .venv/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+# Anchored to the repo root with a leading slash. Unanchored, these Python
+# packaging names match at ANY depth — `lib/` silently excluded web/lib/, so
+# 13 TypeScript source files were never in git and a fresh clone could not build.
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -36,9 +39,12 @@ env
 *~
 
 # Environment
+# Every .env variant is ignored, not a list of the ones we thought of: a real
+# `.env.bak.<timestamp>` full of live keys sat here untracked and un-ignored,
+# one `git add -A` away from being published.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.pem
 
 # Database
@@ -93,9 +99,14 @@ htmlcov/
 node_modules/
 web/.next/
 web/*.tsbuildinfo
+# tsc output from web/lib/indicators.check.ts — see the command in its header
+web/.checkout/
 .next/
 
 # Claude Code local config (machine-specific, not project code)
 .claude/
 .agents/
 .mcp.json
+# runtime ETL output — regenerated daily by ingestion/scheduler.py
+db/fno_plans/
+db/tv_draw_plans/

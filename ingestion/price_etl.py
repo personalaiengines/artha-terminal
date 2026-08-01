@@ -274,7 +274,11 @@ class PriceETL:
             else:
                 period = "5y"
 
-            history = self.yahoo.get_history(symbol, period=period, interval="1d")
+            # BSE-only symbols have no .NS listing — suffix must match the
+            # actual exchange or yfinance 404s and the ETL silently gets nothing.
+            exch = self._exchange_map().get(symbol.upper())
+            suffixed = f"{symbol}.BO" if exch == "BSE" else f"{symbol}.NS"
+            history = self.yahoo.get_history(suffixed, period=period, interval="1d")
 
             if history:
                 # Filter to requested date range
