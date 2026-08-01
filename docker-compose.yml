@@ -24,7 +24,9 @@ services:
     environment:
       - ARTHA_DB_PATH=/data/db/artha.db
     ports:
-      - "8000:8000"
+      # Loopback only: no route here is authenticated, and /api/holdings returns
+      # the real book. The web container reaches this as http://api:8000 instead.
+      - "127.0.0.1:8000:8000"
     volumes:
       - artha-db:/data/db
     healthcheck:

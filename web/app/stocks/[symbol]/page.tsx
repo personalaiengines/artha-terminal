@@ -165,7 +165,7 @@ export default function StockResearch({ params }: { params: Promise<{ symbol: st
                 </p>
               ) : (
                 <p className="text-[13px] leading-relaxed text-mist">
-                  {stock.name} screens <span className="font-semibold text-frost">{stock.aiRating.toLowerCase()}</span> at a score of {stock.aiScore}/10, computed from
+                  {stock.name} screens as <span className="font-semibold text-frost">{stock.aiRating.toLowerCase()}</span> at a score of {stock.aiScore}/10, computed from
                   {stock.scoreKind === "scorecard"
                     ? " valuation, growth, financial health, momentum and sector sub-scores."
                     : <> real price momentum only{stock.rsi != null ? <> and RSI ({stock.rsi.toFixed(0)})</> : ""} — no fundamentals for this symbol yet.</>}

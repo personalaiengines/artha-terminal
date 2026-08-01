@@ -12,6 +12,13 @@ from typing import Optional, Callable
 import os
 
 from config import config
+from agent.tools import TOOL_SCHEMAS
+
+# Completion ceiling for every OpenAI-shaped payload. Without it the length is
+# whatever the provider defaults to, which varies per tier. 4096 is comfortable
+# for GitHub Models (128K context); drop to 2048 if SambaNova (~8K) starts 400ing
+# on a large prompt plus this reserve.
+_MAX_TOKENS = 4096
 
 
 class LLMClient(ABC):
@@ -50,17 +57,13 @@ class OpenRouterClient(LLMClient):
             "Content-Type": "application/json",
         }
 
-        payload = {"model": self._current_model, "messages": messages}
+        payload = {"model": self._current_model, "messages": messages, "max_tokens": _MAX_TOKENS}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
         async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.post(self.base_url, headers=headers, json=payload)
-
-            if response.status_code == 401:
-                raise ValueError("OpenRouter API key invalid or exhausted")
-
             response.raise_for_status()
             return response.json()
 
@@ -194,12 +197,13 @@ class AnthropicClient(LLMClient):
     async def tool_use_loop(self, messages: list, tools: list[Callable]) -> tuple[str, list]:
         """Iterative tool-use loop (same contract as the other clients)."""
         tool_registry = {t.__name__: t for t in tools}
+        schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] in tool_registry]
         max_iterations = 10
         conversation = list(messages)
         tool_calls_log = []
 
         for _ in range(max_iterations):
-            response = await self.chat(conversation, tools=list(tool_registry.keys()))
+            response = await self.chat(conversation, tools=schemas)
             message = response["choices"][0]["message"]
 
             if message.get("tool_calls"):
@@ -242,12 +246,17 @@ class NvidiaNIMClient(LLMClient):
             "Content-Type": "application/json",
         }
 
-        payload = {"model": self.model, "messages": messages}
+        payload = {"model": self.model, "messages": messages, "max_tokens": _MAX_TOKENS}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        # NIM cold-starts a model on first hit and queues; measured live,
+        # meta/llama-3.3-70b-instruct answers in seconds once warm but blows past
+        # 25s cold, so this rung could never win a race it was configured to run.
+        # 60s costs nothing when the model is warm — the client returns as soon as
+        # the response does.
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(self.base_url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
@@ -272,15 +281,91 @@ class SambaNovaClient(LLMClient):
             raise ValueError("SambaNova API key not configured")
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {"model": self.model, "messages": messages}
+        payload = {"model": self.model, "messages": messages, "max_tokens": _MAX_TOKENS}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
         async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.post(self.base_url, headers=headers, json=payload)
-            if response.status_code == 401:
-                raise ValueError("SambaNova API key invalid or exhausted")
+            response.raise_for_status()
+            return response.json()
+
+    async def tool_use_loop(self, messages: list, tools: list[Callable]) -> tuple[str, list]:
+        return await _generic_tool_use_loop(self, messages, tools)
+
+
+class GroqClient(LLMClient):
+    """Groq free tier — same OpenAI-chat shape, and by far the fastest rung here.
+
+    Measured live 2026-07-30 against the tool-calling prompt this app actually
+    sends: openai/gpt-oss-120b answered in 0.5s and llama-3.1-8b-instant in 0.2s,
+    against 7-25s for the NIM rungs and a hard timeout on the two that were
+    configured before. Both carry a 131K context, so this rung serves `deep` as
+    well as `quick`.
+    """
+
+    def __init__(self):
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.api_key = config.ai.groq_api_key
+        self.model = config.ai.groq_model
+
+    async def chat(self, messages: list, tools: list = None) -> dict:
+        if not self.api_key:
+            raise ValueError("Groq API key not configured")
+
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {"model": self.model, "messages": messages, "max_tokens": _MAX_TOKENS}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(self.base_url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+    async def tool_use_loop(self, messages: list, tools: list[Callable]) -> tuple[str, list]:
+        return await _generic_tool_use_loop(self, messages, tools)
+
+
+class GoogleGeminiClient(LLMClient):
+    """Google Gemini free tier, via Google's OpenAI-compatible endpoint.
+
+    Gemini's native API speaks contents/parts/generateContent — a different shape
+    from every other client here. Google also publishes an OpenAI-compatible
+    surface at /v1beta/openai/chat/completions, so this rung is the same twenty
+    lines as the others instead of a bespoke request/response translator. Both
+    were verified live 2026-07-30; the compatible one returns proper `tool_calls`.
+
+    Measured: gemini-flash-latest 3.3s, gemini-flash-lite-latest 0.5s, both with
+    tool calling. A second free quota pool matters here — SambaNova and OpenRouter
+    both 429 regularly, and this one is independent of them.
+
+    Gemini models "think" before answering, and those tokens come out of
+    max_tokens. Verified: at max_tokens=16 the reply came back with
+    finish_reason="length" and NO content at all. _MAX_TOKENS (4096) is ample, but
+    never lower this rung's budget to a small number expecting a short answer —
+    you get an empty string, not a terse one.
+    """
+
+    def __init__(self):
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        self.api_key = config.ai.google_api_key
+        self.model = config.ai.google_model
+
+    async def chat(self, messages: list, tools: list = None) -> dict:
+        if not self.api_key:
+            raise ValueError("Google API key not configured")
+
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {"model": self.model, "messages": messages, "max_tokens": _MAX_TOKENS}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(self.base_url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
 
@@ -302,15 +387,13 @@ class GitHubModelsClient(LLMClient):
             raise ValueError("GitHub Models token not configured")
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {"model": self.model, "messages": messages}
+        payload = {"model": self.model, "messages": messages, "max_tokens": _MAX_TOKENS}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
         async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.post(self.base_url, headers=headers, json=payload)
-            if response.status_code == 401:
-                raise ValueError("GitHub Models token invalid or exhausted")
             response.raise_for_status()
             return response.json()
 
@@ -323,12 +406,13 @@ async def _generic_tool_use_loop(client: LLMClient, messages: list, tools: list[
     OpenRouterClient/NvidiaNIMClient already duplicate) — reused by the two new
     tiers instead of copy-pasting a third/fourth time."""
     tool_registry = {t.__name__: t for t in tools}
+    schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] in tool_registry]
     max_iterations = 10
     conversation = list(messages)
     tool_calls_log = []
 
     for _ in range(max_iterations):
-        response = await client.chat(conversation, tools=list(tool_registry.keys()))
+        response = await client.chat(conversation, tools=schemas)
         message = response["choices"][0]["message"]
 
         if message.get("tool_calls"):
@@ -372,7 +456,7 @@ async def _stream_openai_chat(client: LLMClient, messages: list):
     if not client.api_key:
         raise ValueError(f"{type(client).__name__} not configured")
     url, headers, model = _request_parts(client)
-    payload = {"model": model, "messages": messages, "stream": True}
+    payload = {"model": model, "messages": messages, "stream": True, "max_tokens": _MAX_TOKENS}
     async with httpx.AsyncClient(timeout=120.0) as http:
         async with http.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code >= 400:
@@ -420,10 +504,14 @@ class ModelRouter:
     # expires, no config edit needed. Class-level: ModelRouter is constructed
     # fresh per request, but the skip-list must survive across requests.
     _cooldown: dict[str, float] = {}
+    # Consecutive 429s per tier — see _cooldown_seconds for why a streak matters.
+    _429_streak: dict[str, int] = {}
 
     def __init__(self):
         self.anthropic = AnthropicClient()
         self.clients: dict[str, LLMClient] = {
+            "groq": GroqClient(),
+            "google": GoogleGeminiClient(),
             "openrouter": OpenRouterClient(),
             "nvidia": NvidiaNIMClient(),
             "sambanova": SambaNovaClient(),
@@ -431,12 +519,26 @@ class ModelRouter:
         }
 
     @staticmethod
-    def _cooldown_seconds(exc: Exception) -> Optional[int]:
+    def _cooldown_seconds(exc: Exception, key: Optional[str] = None) -> Optional[int]:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status in (404, 410):
             return 6 * 3600   # model retired/removed upstream
+        if status in (401, 403):
+            return 6 * 3600   # key invalid/expired/revoked — nothing changes until it's replaced
         if status == 429:
-            return 5 * 60     # rate limited — quota resets fast
+            # 429 means two different things here and the body says which for
+            # neither: Groq sends a bare "Rate limit exceeded" with no
+            # Retry-After, SambaNova likewise. Groq's is a per-minute cap that
+            # clears in seconds; SambaNova's and OpenRouter's free tiers are
+            # DAILY caps that clear tomorrow. Treating both as 5 minutes meant
+            # retrying a day-exhausted rung ~288 times, each a full round trip
+            # before falling through. So infer from behaviour instead: a rung
+            # that 429s three times running is capped, not merely busy.
+            if key:
+                n = ModelRouter._429_streak[key] = ModelRouter._429_streak.get(key, 0) + 1
+                if n >= 3:
+                    return 3600
+            return 5 * 60
         return None            # transient (timeout/5xx/connection) — retry next request
 
     @staticmethod
@@ -489,11 +591,12 @@ class ModelRouter:
             try:
                 result = await client.chat(tier_messages, tools)
                 self._cooldown.pop(key, None)
+                self._429_streak.pop(key, None)  # it answered — the streak is over
                 return result
             except Exception as e:
                 errors.append(f"{tier.provider}({tier.model}): {e}")
                 print(f"[warn] Provider failed ({tier.provider}/{tier.model}): {e}")
-                secs = self._cooldown_seconds(e)
+                secs = self._cooldown_seconds(e, key)
                 if secs:
                     self._cooldown[key] = time.time() + secs
                     print(f"[warn] Cooling down {key} for {secs}s")
@@ -525,12 +628,13 @@ class ModelRouter:
                     print(f"[warn] Stream broke mid-answer ({key}): {e}")
                     return
                 errors.append(f"{tier.provider}({tier.model}): {e}")
-                secs = self._cooldown_seconds(e)
+                secs = self._cooldown_seconds(e, key)
                 if secs:
                     self._cooldown[key] = time.time() + secs
                 continue
             if sent:
                 self._cooldown.pop(key, None)
+                self._429_streak.pop(key, None)  # it answered — the streak is over
                 return
             errors.append(f"{tier.provider}({tier.model}): empty stream")
         raise AllTiersExhausted(errors)
@@ -553,11 +657,12 @@ class ModelRouter:
             try:
                 result = await client.tool_use_loop(tier_messages, tools)
                 self._cooldown.pop(key, None)
+                self._429_streak.pop(key, None)  # it answered — the streak is over
                 return result
             except Exception as e:
                 errors.append(f"{tier.provider}({tier.model}): {e}")
                 print(f"[warn] Provider tool-loop failed ({tier.provider}/{tier.model}): {e}")
-                secs = self._cooldown_seconds(e)
+                secs = self._cooldown_seconds(e, key)
                 if secs:
                     self._cooldown[key] = time.time() + secs
                     print(f"[warn] Cooling down {key} for {secs}s")

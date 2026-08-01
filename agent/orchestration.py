@@ -126,12 +126,14 @@ class AgentOrchestrator:
             except Exception as e:
                 logger.warning(f"Debate layer failed for {symbol}: {e}")
 
-        # Cache the result — but never an empty answer. Free-tier models
-        # occasionally return no tool_calls AND empty content (treated as
-        # "done" by the loop above); caching that would lock the symbol into
-        # a blank answer for the full 6h TTL, surviving even a later retry
+        # Cache the result — but never an empty, truncated or failed answer.
+        # Free-tier models occasionally return no tool_calls AND empty content
+        # (treated as "done" by the loop above), and _run_tool_loop returns a
+        # truthy failure string for both the iteration-cap ("truncated") and
+        # exception ("error") paths. Caching any of those would lock the symbol
+        # into a bad answer for the full 6h TTL, surviving even a later retry
         # that would have succeeded.
-        if use_cache and result.get("content"):
+        if use_cache and result.get("content") and not result.get("truncated") and not result.get("error"):
             self._set_cached(cache_key, symbol, analysis_type, result)
 
         return result
@@ -252,13 +254,26 @@ class AgentOrchestrator:
                         "tokens": total_tokens,
                     })
 
-                return {
+                result = {
                     "content": final_content,
                     "tool_calls": all_tool_calls,
                     "model_used": model_used,
                     "tokens_used": total_tokens,
                     "iterations": iteration + 1,
                 }
+
+                # ...unless the model answered on the very first iteration
+                # without calling a single tool. agent/prompts.py forbids
+                # stating a number it didn't get from a tool ("You have no
+                # external knowledge"), so that answer came from training data.
+                # Flagging it stops it being returned as a successful analysis
+                # AND makes the cache guard in analyze() reject it, instead of
+                # locking an ungrounded answer in for the full 6h TTL.
+                if iteration == 0 and not all_tool_calls:
+                    logger.warning("Model produced a final answer without calling any tool")
+                    result["error"] = "no_tool_calls"
+
+                return result
 
             # Exceeded max iterations
             logger.warning("Agent exceeded max iterations")

@@ -60,7 +60,48 @@ def test_parse_handles_missing_and_empty():
     assert out["spot"] == 99
 
 
+def test_prev_close_gives_a_real_per_leg_price_change():
+    # Upstox ships `close_price` (prior settled close) on every leg next to
+    # `prev_oi` — verified live on NIFTY/BANKNIFTY/SENSEX, 100% coverage. That
+    # is what makes the build-up quadrant a per-leg read, not an index proxy.
+    out = _parse_option_chain([
+        {"strike_price": 100, "underlying_spot_price": 99,
+         "call_options": {"market_data": {"ltp": 12.0, "close_price": 10.0, "oi": 5, "prev_oi": 3},
+                          "option_greeks": {"iv": 11.0, "delta": 0.6}},
+         "put_options": {"market_data": {"ltp": 4.0, "close_price": 6.5, "oi": 8, "prev_oi": 9},
+                         "option_greeks": {"iv": 12.0, "delta": -0.4}}},
+    ])
+    s = out["strikes"][0]
+    assert s["call"]["prev_close"] == 10.0
+    assert s["call"]["price_chg"] == 2.0         # 12.0 - 10.0
+    assert s["put"]["price_chg"] == -2.5         # 4.0 - 6.5
+    # no close_price → no change claimed
+    bare = _parse_option_chain([
+        {"strike_price": 100, "underlying_spot_price": 99,
+         "call_options": {"market_data": {"ltp": 12.0}}, "put_options": {}},
+    ])["strikes"][0]
+    assert bare["call"]["prev_close"] is None and bare["call"]["price_chg"] is None
+
+
+def test_a_greek_printed_as_literal_zero_is_reported_absent():
+    # SENSEX's nearest expiry returns iv 0.0 / delta 0.0 on live ATM legs that
+    # carry real OI. Zero is a thin-quote artifact, not a measurement (R17).
+    out = _parse_option_chain([
+        {"strike_price": 100, "underlying_spot_price": 99,
+         "call_options": {"market_data": {"ltp": 12.0, "oi": 500},
+                          "option_greeks": {"iv": 0.0, "delta": 0.0}},
+         "put_options": {"market_data": {"ltp": 4.0, "oi": 500},
+                         "option_greeks": {"iv": 12.0, "delta": -0.4}}},
+    ])
+    s = out["strikes"][0]
+    assert s["call"]["iv"] is None and s["call"]["delta"] is None
+    assert s["call"]["oi"] == 500                # the OI is real and survives
+    assert s["put"]["delta"] == -0.4             # a genuine greek is untouched
+
+
 if __name__ == "__main__":
     test_parse_option_chain()
     test_parse_handles_missing_and_empty()
+    test_prev_close_gives_a_real_per_leg_price_change()
+    test_a_greek_printed_as_literal_zero_is_reported_absent()
     print("OK — option-chain parser")

@@ -69,8 +69,8 @@ export default function Dashboard() {
   };
   const liveWatchlist = withLivePrices(watchlistRows, live);
   const scored = universe.filter((s) => typeof s.aiScore === "number").length;
-  const recos = universe
-    .filter((s) => typeof s.aiScore === "number" && (s.aiRating === "Strong Buy" || s.aiRating === "Buy"))
+  const topScored = universe
+    .filter((s) => typeof s.aiScore === "number" && s.aiRating === "WATCH")
     .sort((a, b) => b.aiScore! - a.aiScore!)
     .slice(0, 3);
   const breadthPct = pulse?.breadth?.pct ?? null;
@@ -218,12 +218,12 @@ export default function Dashboard() {
                 heuristic over 1y/6m return + RSI — calling either one an "AI
                 recommendation" with no qualifier overstates what it knows. */}
             <CardHeader icon={<Sparkles size={16} className="text-ai" />} title="AI Recommendations"
-              subtitle={recos.length === 0 ? "High-conviction ideas"
-                : recos.every((s) => s.scoreKind === "momentum")
+              subtitle={topScored.length === 0 ? "High-conviction ideas"
+                : topScored.every((s) => s.scoreKind === "momentum")
                   ? `Momentum-ranked · ${scored} of ${universe.length} symbols scored`
                   : `Scorecard-ranked · ${scored} of ${universe.length} symbols scored`} />
             <CardBody className="space-y-2">
-              {recos.length > 0 ? recos.map((s) => (
+              {topScored.length > 0 ? topScored.map((s) => (
                 <Link key={s.symbol} href={`/stocks/${s.symbol}`}
                   className="flex items-center gap-3 rounded-[var(--radius-sm)] bg-void/50 p-3 transition-colors hover:bg-raised">
                   <ScoreRing value={s.aiScore} size={44} tone="ai" />

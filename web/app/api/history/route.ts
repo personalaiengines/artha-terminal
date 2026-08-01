@@ -10,7 +10,7 @@ export async function GET(req: Request) {
   const days = searchParams.get("days") ?? "30";
   const ohlc = searchParams.get("ohlc");
   if (!symbols) return NextResponse.json({ ok: true, series: {} });
-  const q = `symbols=${encodeURIComponent(symbols)}&days=${days}${ohlc ? "&ohlc=1" : ""}`;
+  const q = `symbols=${encodeURIComponent(symbols)}&days=${encodeURIComponent(days)}${ohlc ? "&ohlc=1" : ""}`;
   const r = await fromApi<any>(`/api/history?${q}`, 10000);
   if (!r) return NextResponse.json({ ok: false, series: {}, candles: [] });
   if (ohlc) return NextResponse.json({ ok: true, candles: r.candles ?? [] });

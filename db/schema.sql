@@ -52,6 +52,29 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 );
 
 -- ============================================
+-- Table: prices_intraday
+-- 1-MINUTE bars only. Coarser resolutions (5m/15m/1h) are resampled from these
+-- at read time in services/intraday.py — Upstox hard-rejects those intervals
+-- (HTTP 400 UDAPI1020: "Interval accepts one of (1minute,30minute,day,week,
+-- month)"), so they can never be fetched, only computed.
+--
+-- `ts` is Unix SECONDS, UTC, and is the bar's OPEN time.
+-- No FK to symbol_master on purpose: the F&O indices (NIFTY/BANKNIFTY/SENSEX)
+-- are not instruments in symbol_master, and a FK would reject every row.
+-- ============================================
+CREATE TABLE IF NOT EXISTS prices_intraday (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume INTEGER,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_intraday_symbol_ts ON prices_intraday(symbol, ts);
+
+-- ============================================
 -- Table: fii_dii_flows
 -- Daily FII/DII net cash-market flows (NSE), accumulated for trend
 -- ============================================
@@ -314,6 +337,39 @@ CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache(expires_at);
 -- Audit log queries
 CREATE INDEX IF NOT EXISTS idx_audit_log_type ON audit_log(event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
+
+-- ============================================
+-- User Data: Alerts + Watchlists
+-- ============================================
+-- These three were created inline by the API handlers (_ensure_alerts /
+-- _ensure_watchlists in api/server.py), so a fresh database only grew them
+-- once someone hit the matching route. They belong here with the rest of the
+-- schema; init_database() re-runs this file on every start and every statement
+-- is IF NOT EXISTS, so this is a no-op on a database that already has them.
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    type TEXT NOT NULL,
+    condition TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS watchlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The ON DELETE CASCADE only fires on a connection that has
+-- PRAGMA foreign_keys=ON; api/server.py's watchlists_delete sets it per-call.
+CREATE TABLE IF NOT EXISTS watchlist_items (
+    list_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+    added TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (list_id, symbol)
+);
 
 -- ============================================
 -- Triggers for Auto-update

@@ -22,7 +22,18 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from agent.prompts import COMPLIANCE, GROUNDING, HOUSE_STYLE
 from db import get_connection
+
+# The two-sentence bound is this surface's own — HOUSE_STYLE keys length to
+# scope, and the pulse strapline's scope is two sentences.
+_SYSTEM = (
+    f"{GROUNDING}\n\n{HOUSE_STYLE}\n\n{COMPLIANCE}\n\n"
+    "You are a senior Indian equity market strategist. In EXACTLY two crisp "
+    "sentences, interpret today's market internals — whether the move is broad "
+    "or narrow, any sector rotation, and the risk tone. Plain prose: no "
+    "headings, no bullets, no disclaimer line."
+)
 
 
 # ------------------------------------------------------------------
@@ -287,14 +298,7 @@ def get_strategist_read(pulse: dict) -> dict:
 
     # "quick": two sentences off a small facts block. Falls back to the
     # deterministic breadth line rather than showing nothing.
-    text = complete(
-        "You are a senior Indian equity market strategist. In EXACTLY two crisp "
-        "sentences, interpret today's market internals — comment on whether the move "
-        "is broad or narrow, any sector rotation, and the risk tone. Be specific and "
-        "professional. No preamble, no disclaimers, no buy/sell advice.",
-        prompt,
-        task_shape="quick",
-    ).strip()
+    text = complete(_SYSTEM, prompt, task_shape="quick").strip()
     return {"text": text, "ai": True} if text else {"text": fallback, "ai": False}
 
 

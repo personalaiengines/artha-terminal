@@ -29,7 +29,7 @@ import logging
 import re
 from typing import AsyncIterator, Optional
 
-from agent.prompts import COMPLIANCE, GROUNDING
+from agent.prompts import COMPLIANCE, GROUNDING, HOUSE_STYLE, fence_untrusted
 
 logger = logging.getLogger("agent.chat")
 
@@ -92,8 +92,9 @@ _STOPWORD_TICKERS = {
 # actually spells them in caps, or when the full company name matched. Every
 # other ticker still matches case-insensitively, since users type "tcs price".
 _AMBIGUOUS_TICKERS = {
-    "ACE", "ALPHA", "APEX", "BETA", "DOLLAR", "ENERGY", "GLOBAL", "OIL",
-    "SIGMA", "SILVER", "STAR", "TECH", "WEALTH",
+    "ACE", "ACTIVE", "ADVANCE", "ALPHA", "APEX", "BETA", "DOLLAR", "ENERGY",
+    "FOCUS", "GLOBAL", "OIL", "ROYAL", "SIGMA", "SILVER", "STAR", "SUPER",
+    "SUPREME", "TECH", "TOTAL", "WEALTH",
 }
 
 
@@ -170,8 +171,16 @@ def _mask_instructions(text: str) -> str:
     return text
 
 
-def extract_symbols(question: str, limit: int = MAX_SYMBOLS) -> list[str]:
-    """Every symbol mentioned, in the order mentioned, word-boundary matched."""
+def extract_symbols(question: str, limit: int = MAX_SYMBOLS,
+                    strict_case: bool = False) -> list[str]:
+    """Every symbol mentioned, in the order mentioned, word-boundary matched.
+
+    `strict_case` widens the case-evidence rule from `_AMBIGUOUS_TICKERS` to
+    every ticker. Used when reading a symbol back out of conversation history,
+    where a bare lowercase English word is prose, not a subject. Company-name
+    needles are exempt — spelling out "Tata Consultancy Services" names the
+    subject whatever its casing.
+    """
     up = _normalize(_mask_instructions(question))
     found: list[tuple[int, str]] = []
     claimed: list[tuple[int, int]] = []
@@ -180,7 +189,7 @@ def extract_symbols(question: str, limit: int = MAX_SYMBOLS) -> list[str]:
         # A bare ambiguous ticker needs the user to have actually capitalised it.
         # Checked against the raw question, not the upper-cased form, which is
         # where that evidence is destroyed.
-        if needle in _AMBIGUOUS_TICKERS and not re.search(
+        if ((strict_case and needle == sym) or needle in _AMBIGUOUS_TICKERS) and not re.search(
                 rf"(?<![\w&]){re.escape(needle)}(?![\w&])", question):
             continue
         for m in re.finditer(rf"(?<![\w&]){re.escape(needle)}(?![\w&])", up):
@@ -224,11 +233,18 @@ def resolve(question: str, history: list[dict] | None = None) -> tuple[list[str]
     Resolving without history routed "What about its debt?" as a market
     question and fired a web search, because the pronoun carries the subject.
     Callers must not re-derive this.
+
+    The history pass is `strict_case`: a subject may only come from a ticker the
+    user actually capitalised. "What is teh last closing price" after "How active
+    is the market today?" used to bind ACTIVE (Active Clothing Co) and answer
+    with full confidence about a microcap nobody had named. With no symbol ever
+    named the turn resolves none, routes `market`, and is answered from the live
+    index board.
     """
     symbols = extract_symbols(question)
     if not symbols:
         for m in reversed(trim_history(history or [])):
-            prior = extract_symbols(m["content"])
+            prior = extract_symbols(m["content"], strict_case=True)
             if prior:
                 symbols = prior[:1]
                 break
@@ -572,14 +588,7 @@ _STYLE = f"""You are ARTHA, an equity research analyst for Indian markets (NSE/B
 - The data you were given is the DATA block below. You DO have live data — it is
   provided there. Never claim you cannot access real-time information.
 
-STYLE:
-- Answer the question that was asked, first, in the first sentence. Add context after.
-- Markdown: **bold** for key figures, `##` headings only when the answer has
-  genuinely separate sections, tables for any comparison of 3+ metrics.
-- Short paragraphs and tight bullets. No filler preamble, no restating the question.
-- Currency as Rs, returns as %, market cap in Cr — the units the data uses.
-- Match the answer's length to the question's scope. A one-fact question gets a
-  one-line answer, not a report.
+{HOUSE_STYLE}
 
 {COMPLIANCE}
 Do not append a disclaimer to every message — the interface already shows one."""
@@ -655,6 +664,11 @@ _DEEP_TOOLS = (
     ("scan_red_flags",    "Scanning for red flags",  "red flags"),
     ("compute_scorecard", "Computing the scorecard", "scorecard"),
     ("resolve_peers",     "Resolving sector peers",  "peer group"),
+    # Index context: a deep dive that never says which indices a stock belongs
+    # to is missing the cheapest piece of "where does this sit" there is.
+    # Institutional flows are deliberately NOT here — they are market-wide, take
+    # no symbol, and already reach this path through _market_snapshot_text().
+    ("get_index_membership", "Checking index membership", "index membership"),
 )
 
 # Deterministic engine output must reach the model as-is: these two are the
@@ -789,14 +803,19 @@ async def answer(
 
     if market_context and intent in ("market", "portfolio", "deep", "screen"):
         blocks.append(f"### Live market context\n{market_context}")
-    if web_context:
-        blocks.append(f"### Live web search results\n{web_context}")
 
     yield "status", {"stage": "thinking"}
 
     from agent.llm_client import ModelRouter, AllTiersExhausted
     msgs = [{"role": "system", "content": build_system(intent, blocks)}]
     msgs += history
+    # Web snippets are scraped from arbitrary third-party pages. In `blocks`
+    # they became part of the SYSTEM prompt, giving anything on those pages the
+    # same authority as the grounding rules. Delimited user-role message,
+    # immediately before the question; GROUNDING (agent/prompts.py) tells the
+    # model that what is between these markers is data, never instructions.
+    if web_context:
+        msgs.append({"role": "user", "content": fence_untrusted(web_context)})
     msgs.append({"role": "user", "content": question})
 
     shape = "deep" if intent in ("deep", "compare", "portfolio") else "quick"

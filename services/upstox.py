@@ -80,6 +80,16 @@ def _quote_change(v: dict) -> tuple[float | None, float | None, float | None]:
     return last, prev, None
 
 
+def _greek(v) -> float | None:
+    """
+    A greek Upstox printed as literally 0.0 is a thin-quote artifact, not a
+    measurement — SENSEX's nearest expiry returns iv 0.0 / delta 0.0 on live
+    ATM legs that carry real OI and volume. Report it as ABSENT so nothing
+    downstream renders a zero as if the leg had been priced.
+    """
+    return _num(v) or None
+
+
 def _parse_option_chain(raw: list[dict]) -> dict:
     """
     Normalise Upstox's /v2/option/chain response into a compact shape.
@@ -92,7 +102,8 @@ def _parse_option_chain(raw: list[dict]) -> dict:
           "spot": float | None,
           "strikes": [
              {"strike": float,
-              "call": {"ltp","oi","prev_oi","oi_change","iv","volume","delta"},
+              "call": {"ltp","oi","prev_oi","prev_close","oi_change",
+                       "price_chg","iv","volume","delta"},
               "put":  {...same...}},
              ...  # sorted ascending by strike
           ],
@@ -112,14 +123,22 @@ def _parse_option_chain(raw: list[dict]) -> dict:
             gk = (side or {}).get("option_greeks", {}) or {}
             oi = _num(md.get("oi"))
             prev_oi = _num(md.get("prev_oi"))
+            ltp = _num(md.get("ltp"))
+            # Upstox pairs `close_price` with `prev_oi` — both are the PRIOR
+            # session's settled value for this leg. That is what makes an OI
+            # build-up quadrant classifiable per leg (price change × OI change)
+            # instead of proxied from the index move.
+            prev_close = _num(md.get("close_price"))
             return {
-                "ltp": _num(md.get("ltp")),
+                "ltp": ltp,
                 "oi": oi,
                 "prev_oi": prev_oi,
+                "prev_close": prev_close,
                 "oi_change": (oi - prev_oi) if (oi is not None and prev_oi is not None) else None,
-                "iv": _num(gk.get("iv")),
+                "price_chg": (ltp - prev_close) if (ltp is not None and prev_close is not None) else None,
+                "iv": _greek(gk.get("iv")),
                 "volume": _num(md.get("volume")),
-                "delta": _num(gk.get("delta")),
+                "delta": _greek(gk.get("delta")),
             }
 
         strikes.append({

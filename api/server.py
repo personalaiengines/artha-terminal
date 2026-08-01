@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 import functools
 import threading
@@ -25,8 +26,15 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
 from api.ws import ws_endpoint, manager as ws_manager
+from api.udf import routes as udf_routes
 
 from db import get_connection
+
+# httpx logs the full request URL at INFO. Several upstreams take their
+# credential as a query parameter (SerpAPI `api_key=`, Finnhub `token=`), so
+# every search wrote a live key into the container logs in plaintext. WARNING
+# keeps the failures and drops the URL line.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _POOL = ThreadPoolExecutor(max_workers=8)
 # LLM/agent routes (stock analysis, F&O narrative, AI chat) run 10-90s per
@@ -55,6 +63,35 @@ _refresh_lock = threading.Lock()
 # for _POOL workers, or a slow refresh would stall real requests.
 _REFRESH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cache-refresh")
 
+# Keys are per-argument (`_cached_call_arg` builds "hist:30:A,B,C"), so an
+# unbounded dict grows with every distinct symbol set a client ever asks for.
+_CACHE_MAX = 256
+
+
+def _cache_put(key: str, val: object) -> None:
+    """Store and evict oldest-first. `dict` is insertion-ordered, so the first
+    key is the oldest inserted — good enough here; nothing needs true LRU.
+    ponytail: FIFO, not LRU. Swap in an OrderedDict/move_to_end if a hot key
+    ever gets evicted while still being read.
+
+    A FAILURE IS NEVER CACHED. One transient upstream blip used to be frozen
+    for the whole TTL: `/api/fno/nifty50` served
+    {"ok": false, "error": "no option expiries available"} in 0.0s while
+    `/api/fno/nifty50/expiries` was concurrently returning all 18 of them, and
+    `/api/positions` served a blank error against a healthy Upstox session.
+    Both recovered the moment the process restarted, which is the tell.
+    Refusing to store the failure costs a retry on the next request — the
+    endpoint is broken anyway — and it self-heals instead of waiting out
+    a 15-to-60-minute TTL.
+    """
+    if isinstance(val, dict) and val.get("ok") is False:
+        logging.getLogger("api.cache").warning(
+            "not caching failed result for %s: %s", key, val.get("error") or val.get("message") or "")
+        return
+    _cache[key] = (time.time(), val)
+    while len(_cache) > _CACHE_MAX:
+        _cache.pop(next(iter(_cache)))
+
 
 def _swr(key: str, produce, ttl: float):
     """Return cached value, refreshing in the background once it goes stale.
@@ -70,7 +107,7 @@ def _swr(key: str, produce, ttl: float):
 
     if hit is None:
         val = produce()
-        _cache[key] = (time.time(), val)
+        _cache_put(key, val)
         return val
 
     # Stale: hand back the old value now, kick off a single refresh.
@@ -83,7 +120,7 @@ def _swr(key: str, produce, ttl: float):
         def _refresh():
             try:
                 val = produce()
-                _cache[key] = (time.time(), val)
+                _cache_put(key, val)
             except Exception as e:
                 # Keep serving the stale value; a failed refresh must not
                 # evict good data or surface as a request error.
@@ -129,15 +166,20 @@ async def unhandled(req, exc):
     this response is sent, so uvicorn logs the traceback as well.
     """
     logging.getLogger("api.server").warning(f"{req.url.path} failed: {exc}")
-    return JSONResponse({"ok": False, "error": str(exc)})
+    # The exception text stays in the log: it carries SQLite messages and
+    # absolute file paths. The client gets a fixed string and a real 5xx, so
+    # monitoring actually sees the failure instead of a 200.
+    return JSONResponse({"ok": False, "error": "internal error"}, status_code=500)
 
 
 # ======================================================================
 # Equity universe — pure DB (fast, reliable). Powers screener / watchlist
 # / dashboard / stock header. Shaped to the front-end `Stock` type.
 # ======================================================================
-_RATING = lambda s: ("Strong Buy" if s >= 8.2 else "Buy" if s >= 6.8 else
-                     "Hold" if s >= 5 else "Reduce" if s >= 3.5 else "Sell")
+# Soft signals only — the same token set the LLM contract uses (agent/prompts.py).
+# Bands are collapsed from the old five, not retuned: a symbol lands in the same
+# tone bucket it did before, only the word changed.
+_RATING = lambda s: ("WATCH" if s >= 6.8 else "HOLD" if s >= 5 else "REVIEW")
 
 def _momentum_score(r1y, r6m, rsi):
     """Real, deterministic ARTHA score (0-10) from live price signals only —
@@ -352,7 +394,15 @@ def _news_from_cache_or_live() -> dict:
     return get_live_market_news()
 
 async def news(req):
-    return ok(await run(_cached_call, "news", _news_from_cache_or_live, 900))
+    payload = await run(_cached_call, "news", _news_from_cache_or_live, 900)
+    # The briefing carries the phase it was WRITTEN in (briefing.phase); this is
+    # the phase right NOW. They differ for up to one curation cycle around the
+    # bell, and the UI needs both — otherwise a 15-minute cache leaves the page
+    # captioned "Pre-Open" while the market is already trading.
+    if isinstance(payload, dict):
+        from services.market_news import session_phase
+        payload = {**payload, "phase": session_phase()}
+    return ok(payload)
 
 async def flows(req):
     from services.institutional_flows import get_institutional_snapshot
@@ -380,7 +430,7 @@ def _events() -> dict:
         except Exception:
             ai = {"india": [], "international": [], "ok": False}
         if ai.get("ok"):
-            _cache["events_ai"] = (time.time(), ai)
+            _cache_put("events_ai", ai)
 
     base["india"] = sorted(base["india"] + ai.get("india", []), key=lambda e: e["date"])
     base["international"] = sorted(base["international"] + ai.get("international", []), key=lambda e: e["date"])
@@ -393,25 +443,126 @@ async def events(req):
 _FNO_KEY = {"NIFTY": "nifty50", "NIFTY50": "nifty50", "BANKNIFTY": "banknifty",
             "BANK NIFTY": "banknifty", "SENSEX": "sensex"}
 
-async def fno(req):
+# India VIX percentile window — one trailing year of sessions (R13).
+_VIX_WINDOW = 252
+
+# Shape guard for a user-supplied ?expiry=. Membership is checked upstream in
+# fno_service._build_async (where the listed set lives); this only keeps junk
+# out of the cache keys it would otherwise mint one of per distinct value.
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def _fno_index(req) -> str:
+    """Path index name -> fno_service key."""
     idx = req.path_params.get("index", "NIFTY").upper()
-    key = _FNO_KEY.get(idx, idx.lower())
+    return _FNO_KEY.get(idx, idx.lower())
+
+def _fno_plan(key: str, expiry: str | None = None) -> dict:
+    """
+    The cached game plan plus India VIX in the only context that means
+    anything: its own trailing-252-session percentile.
+
+    Attached HERE, not in fno_service: the VIX history lives in prices_daily
+    (ingestion/index_history.py writes INDIAVIX), and services.fno_analysis is
+    deliberately I/O-free. `_candles` carries the dates, which `_history` drops
+    — so `vix_as_of` comes from the same read as the closes, not a second query.
+    """
     from services.fno_service import build_game_plan
-    val = await run(_cached_call_arg, f"fno:{key}", build_game_plan, key, 120)
-    return ok(val)
+    from services.fno_analysis import percentile_rank
+    # No expiry -> the original key, so the narrative route below still shares
+    # this cache entry instead of building the same plan a second time.
+    ck = f"fno:{key}:{expiry}" if expiry else f"fno:{key}"
+    plan = _swr(ck, lambda: build_game_plan(key, expiry), 120)
+    if not plan.get("ok"):
+        return plan
+    rows = _candles("INDIAVIX", _VIX_WINDOW)
+    closes = [r["close"] for r in rows]
+    return {**plan,
+            "vix_percentile": percentile_rank(closes, plan.get("india_vix")),
+            "vix_window": len(closes),
+            "vix_as_of": rows[-1]["t"] if rows else None}
+
+async def fno(req):
+    expiry = req.query_params.get("expiry") or None
+    if expiry and not _ISO_DATE.match(expiry):
+        return JSONResponse({"ok": False, "error": "invalid expiry"}, status_code=400)
+    return ok(await run(_fno_plan, _fno_index(req), expiry))
+
+def _fno_expiries(key: str) -> dict:
+    """Every listed expiry for one index. An expiry list changes at most daily,
+    hence the hour — but an empty/failed list is not an hour-good answer, so it
+    is dropped from the cache and the next caller retries."""
+    from services.fno_service import get_expiries
+    ck = f"fno_expiries:{key}"
+    res = _swr(ck, lambda: get_expiries(key), 3600)
+    if not res.get("ok"):
+        _cache.pop(ck, None)
+    return res
+
+async def fno_expiries(req):
+    return JSONResponse(await run(_fno_expiries, _fno_index(req)))
+
+def _fno_term(key: str) -> dict:
+    """ATM IV across the nearest few expiries (the cap travels as `cap`).
+
+    A partial read — one expiry that failed or carried no live ATM IV — is
+    degraded, not good for 15 minutes: it is evicted so the next caller refetches
+    rather than being served a short curve as if it were the whole one.
+
+    ponytail: an index whose far expiries are unpriced ALL session (BANKNIFTY
+    today) therefore refetches on every request — 4 upstream calls, ~1.2s. Give
+    the degraded case its own short TTL if a page ever polls this hot."""
+    from services.fno_service import term_structure
+    ck = f"fno_term:{key}"
+    res = _swr(ck, lambda: term_structure(key), 900)
+    if not res.get("complete"):
+        _cache.pop(ck, None)
+    return res
+
+async def fno_term(req):
+    return JSONResponse(await run(_fno_term, _fno_index(req)))
 
 def _fno_narrative(key: str) -> dict:
-    """LLM narrative (free OpenRouter/NIM models) over the deterministic F&O
-    game plan. services/fno_narrative.py existed but was never wired to an endpoint."""
+    """The /options AI surface: microstructure — what the skew across strikes and
+    the term structure across expiries price in (services/fno_narrative.py).
+
+    The term structure is a separate read, so it comes from the same 900s-cached
+    helper the /term route serves rather than a fresh set of chain fetches."""
     from services.fno_service import build_game_plan
     from services.fno_narrative import get_fno_narrative
     plan = _cached_call_arg(f"fno:{key}", build_game_plan, key, 120)
-    return get_fno_narrative(plan)
+    return get_fno_narrative(plan, _fno_term(key))
+
+def _fno_oi_read(key: str) -> dict:
+    """The /fno AI surface: where open interest moved this session and what that
+    says about the writers' defence (services/fno_oi_read.py).
+
+    Shares the `fno:{key}` plan entry with the route above — one chain fetch
+    feeds both surfaces."""
+    from services.fno_service import build_game_plan
+    from services.fno_oi_read import get_oi_read
+    plan = _cached_call_arg(f"fno:{key}", build_game_plan, key, 120)
+    return get_oi_read(plan)
+
+def _cached_llm(ck: str, fn, arg: str, ttl: float) -> dict:
+    """Cache an LLM markdown surface — but only when it came back whole.
+
+    A degraded answer (`ok: False`: the provider chain fell over mid-call, or a
+    model replied without a single one of the requested sections) is evicted, so
+    the next caller retries instead of being served the wreck for 15 minutes.
+    This project has already been bitten by exactly that: a news read returned 2
+    of 18 items after a mid-call 429 and cached it."""
+    res = _swr(ck, lambda: fn(arg), ttl)
+    if not (res or {}).get("ok"):
+        _cache.pop(ck, None)
+    return res
 
 async def fno_narrative_route(req):
-    idx = req.path_params.get("index", "NIFTY").upper()
-    key = _FNO_KEY.get(idx, idx.lower())
-    return JSONResponse(await run_llm(_cached_call_arg, f"fno_narrative:{key}", _fno_narrative, key, 900))
+    key = _fno_index(req)
+    return JSONResponse(await run_llm(_cached_llm, f"fno_narrative:{key}", _fno_narrative, key, 900))
+
+async def fno_oi_read_route(req):
+    key = _fno_index(req)
+    return JSONResponse(await run_llm(_cached_llm, f"fno_oi_read:{key}", _fno_oi_read, key, 900))
 
 # module-level cached callers (so the ThreadPool sees a top-level fn)
 def _cached_call(key, fn, ttl):
@@ -586,25 +737,33 @@ def _ai(question: str) -> dict:
     if syms:
         tools.append("ARTHA database")
 
-    if intent in ("market", "portfolio", "screen"):
+    if intent in ("market", "portfolio", "deep", "screen"):
         ctx, ctx_used = _market_snapshot_text()
         if ctx:
             blocks.append(f"### Live market context\n{ctx}")
             tools += list(ctx_used)
     # Only a genuinely open question earns a web search. Firing it on a screen
     # is what let foreign listings into an answer about Indian pharma.
+    web = ""
     if intent == "market":
         web, web_used = _web_search(question)
         if web:
-            blocks.append(f"### Live web search results\n{web}")
             tools.append("Web search")
 
     system = build_system(intent, blocks)
     from agent.llm_client import ModelRouter, AllTiersExhausted
     client = ModelRouter()
     import asyncio
-    msgs = [{"role": "system", "content": system},
-            {"role": "user", "content": question}]
+    # Web snippets are scraped from arbitrary third-party pages, so they stay
+    # OUT of the system prompt — inside it they carried the same authority as
+    # the grounding rules themselves. Delimited user-role message instead; the
+    # GROUNDING contract (agent/prompts.py) tells the model to treat anything
+    # between these markers as data, never as instructions.
+    msgs = [{"role": "system", "content": system}]
+    if web:
+        from agent.prompts import fence_untrusted
+        msgs.append({"role": "user", "content": fence_untrusted(web)})
+    msgs.append({"role": "user", "content": question})
     loop = asyncio.new_event_loop()
     try:
         resp = loop.run_until_complete(client.chat(
@@ -617,19 +776,44 @@ def _ai(question: str) -> dict:
     answer = ""
     model = None
     try:
-        answer = resp["choices"][0]["message"]["content"]
+        answer = resp["choices"][0]["message"]["content"] or ""
         model = resp.get("model")
     except Exception:
         answer = ""
-    return {"ok": bool(answer), "answer": (prefix + answer) if answer else answer,
+    if not answer:
+        # A provider can return 200 with empty content — reasoning models put the
+        # chain of thought in `message.reasoning`, and a stop mid-way leaves
+        # `content` blank. This used to return {"ok": false, "answer": ""} with no
+        # log and no error, so the UI showed its scripted demo answer and the
+        # failure was indistinguishable from a real reply. Say what happened.
+        choice = (resp.get("choices") or [{}])[0] if isinstance(resp, dict) else {}
+        logging.getLogger("api.server").warning(
+            "empty answer from %s (finish_reason=%s, reasoning=%d chars)",
+            resp.get("model") if isinstance(resp, dict) else "?",
+            choice.get("finish_reason"),
+            len((choice.get("message") or {}).get("reasoning") or ""))
+        return {"ok": False, "error": "empty_answer", "answer": "",
+                "detail": f"{resp.get('model') if isinstance(resp, dict) else 'model'} "
+                          f"returned no answer text (finish_reason="
+                          f"{choice.get('finish_reason')})",
+                "symbol": syms[0] if syms else None,
+                "tools": tools, "model": model, "cards": syms}
+    return {"ok": True, "answer": prefix + answer,
             "symbol": syms[0] if syms else None,
             "tools": tools, "model": model, "cards": syms}
+
+# A real question fits comfortably; past this it is either an accident or an
+# attempt to blow a context window (and a tier's token quota) with one POST.
+_MAX_QUESTION = 2000
+
 
 async def ai(req):
     body = await req.json()
     q = (body.get("q") or "").strip()
     if not q:
         return JSONResponse({"ok": False, "error": "empty query"})
+    if len(q) > _MAX_QUESTION:
+        return JSONResponse({"ok": False, "error": "question too long"}, status_code=400)
     return JSONResponse(await run_llm(_ai, q))
 
 
@@ -680,6 +864,8 @@ async def ai_stream(req):
     q = (body.get("q") or "").strip()
     if not q:
         return JSONResponse({"ok": False, "error": "empty query"}, status_code=400)
+    if len(q) > _MAX_QUESTION:
+        return JSONResponse({"ok": False, "error": "question too long"}, status_code=400)
     return StreamingResponse(
         _sse_chat(q, body.get("history") or []),
         media_type="text/event-stream",
@@ -701,16 +887,21 @@ def _brief() -> dict:
     ctx, used = _market_snapshot_text()
     if not ctx:
         return {"ok": False, "brief": "", "sources": []}
+    # The shared contract first, then the format rules specific to this surface.
+    # This prompt used to hand-roll its own grounding and style ("never invent a
+    # figure", "no 'as an AI'") — a sixth copy of rules that live in
+    # agent/prompts.py, so every hardening made there missed the dashboard brief.
+    # Its bullet-list structure below is FORMAT, not grounding, so it stays and
+    # wins over HOUSE_STYLE's general markdown guidance.
+    from agent.prompts import COMPLIANCE, GROUNDING, HOUSE_STYLE
     system = (
+        f"{GROUNDING}\n\n{HOUSE_STYLE}\n\n{COMPLIANCE}\n\n"
         "You are ARTHA, an equity research desk writing the daily market round-up "
         "for Indian markets (NSE/BSE). Write for an intelligent reader who is NOT "
         "a market professional.\n\n"
         "RULES\n"
         "- Plain, simple English. Short sentences. No jargon unless you explain it "
         "in the same breath (e.g. 'breadth — how many stocks rose versus fell').\n"
-        "- Ground EVERY claim in a number from the live data below. Never invent a "
-        "figure, a stock, or a reason. If the data doesn't say why something moved, "
-        "say what moved and that the driver isn't in the data.\n"
         "- Output a markdown BULLET LIST. Every line starts with '- ' followed by a "
         "bold label, then the point. Nothing else — no intro paragraph, no prose "
         "blocks between bullets.\n"
@@ -725,7 +916,9 @@ def _brief() -> dict:
         "  - **Watch next** — 2-3 concrete things to keep an eye on.\n"
         "- One or two sentences per bullet, maximum. Skip any bullet the data "
         "doesn't cover — do not pad it with generalities.\n"
-        "- No preamble, no sign-off, no disclaimer, no 'as an AI'.\n\n"
+        # Preamble/sign-off/"as an AI" are HOUSE_STYLE's job. Only the
+        # no-disclaimer rule is specific to this surface.
+        "- No compliance disclaimer line; the page carries one already.\n\n"
         "LIVE DATA (this is everything you know; the market state is as of now):\n" + ctx
     )
     from agent.llm_client import ModelRouter, AllTiersExhausted
@@ -756,30 +949,14 @@ async def brief(req):
 
 
 # ======================================================================
-# Alerts — real persistence (create/list/delete). Own tiny table.
+# Alerts — real persistence (create/list/delete). Table lives in db/schema.sql.
 # ======================================================================
-def _ensure_alerts():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                type TEXT NOT NULL,
-                condition TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.commit()
-
 async def alerts_list(req):
-    _ensure_alerts()
     with get_connection() as conn:
         rows = conn.execute("SELECT id, symbol, type, condition, status, created FROM alerts ORDER BY created DESC").fetchall()
     return JSONResponse({"ok": True, "items": [dict(r) for r in rows]})
 
 async def alerts_create(req):
-    _ensure_alerts()
     b = await req.json()
     sym = (b.get("symbol") or "").upper().strip()
     typ = (b.get("type") or "price").strip()
@@ -793,7 +970,6 @@ async def alerts_create(req):
     return JSONResponse({"ok": True, "id": new_id})
 
 async def alerts_delete(req):
-    _ensure_alerts()
     aid = int(req.path_params["id"])
     with get_connection() as conn:
         conn.execute("DELETE FROM alerts WHERE id=?", (aid,))
@@ -804,28 +980,9 @@ async def alerts_delete(req):
 # ======================================================================
 # Watchlists — real persistence (multiple named lists of symbols). No
 # hardcoded/mock lists — starts empty, user creates lists and adds symbols.
+# Tables live in db/schema.sql.
 # ======================================================================
-def _ensure_watchlists():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS watchlists (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                created TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS watchlist_items (
-                list_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
-                symbol TEXT NOT NULL,
-                added TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (list_id, symbol)
-            )
-        """)
-        conn.commit()
-
 async def watchlists_list(req):
-    _ensure_watchlists()
     with get_connection() as conn:
         lists = conn.execute("SELECT id, name, created FROM watchlists ORDER BY created ASC").fetchall()
         items = conn.execute("SELECT list_id, symbol FROM watchlist_items ORDER BY added ASC").fetchall()
@@ -837,7 +994,6 @@ async def watchlists_list(req):
     return JSONResponse({"ok": True, "items": out})
 
 async def watchlists_create(req):
-    _ensure_watchlists()
     b = await req.json()
     name = (b.get("name") or "").strip()
     if not name:
@@ -852,15 +1008,19 @@ async def watchlists_create(req):
     return JSONResponse({"ok": True, "id": new_id, "name": name})
 
 async def watchlists_delete(req):
-    _ensure_watchlists()
     lid = int(req.path_params["id"])
     with get_connection() as conn:
+        # ponytail: FK enforcement is scoped to this connection so the declared
+        # ON DELETE CASCADE on watchlist_items fires. Turning it on globally in
+        # db/__init__.py is blocked on cleaning up the symbol_master orphans —
+        # prices_daily/fundamentals/agent_cache already violate those FKs, so a
+        # global pragma would make ingestion inserts raise IntegrityError.
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("DELETE FROM watchlists WHERE id=?", (lid,))
         conn.commit()
     return JSONResponse({"ok": True})
 
 async def watchlist_add_symbol(req):
-    _ensure_watchlists()
     lid = int(req.path_params["id"])
     b = await req.json()
     sym = (b.get("symbol") or "").upper().strip()
@@ -872,7 +1032,6 @@ async def watchlist_add_symbol(req):
     return JSONResponse({"ok": True})
 
 async def watchlist_remove_symbol(req):
-    _ensure_watchlists()
     lid = int(req.path_params["id"])
     sym = req.path_params["symbol"].upper()
     with get_connection() as conn:
@@ -910,7 +1069,7 @@ async def upstox_token(req):
     # three successful exchanges in 62 seconds.
     if isinstance(res, dict) and res.get("ok"):
         for key in ("upstox_status", "system_status", "data_health",
-                    "holdings", "portfolio_curve"):
+                    "holdings", "positions", "portfolio_curve"):
             _cache.pop(key, None)
     return JSONResponse(res if isinstance(res, dict) else {"ok": False})
 
@@ -963,6 +1122,56 @@ def _holdings() -> dict:
 
 async def holdings(req):
     return JSONResponse(await run(_cached_call, "holdings", _holdings, 120))
+
+
+# Derivatives segments. An equity position in the same book is not part of the
+# F&O surface and is dropped rather than shown under an F&O heading.
+_FNO_EXCHANGES = ("NFO", "BFO")
+
+def _positions() -> dict:
+    """The user's live F&O positions — READ-ONLY.
+
+    Reads the book and nothing else: no order is placed, modified or cancelled
+    here or anywhere this route reaches. Only the seven display fields below
+    leave the process; the raw row's ~29 keys (account-level values, day-wise
+    breakdowns, instrument tokens) are not forwarded and nothing here logs a
+    symbol, a size or a P&L.
+
+    An expired/missing token is ok:false + the auth status, so the UI prompts a
+    re-authorize. An empty book is a real answer: ok:true with items: [].
+    """
+    from services.upstox import UpstoxClient
+    import asyncio
+    res = asyncio.run(UpstoxClient().get_positions())
+    if res.get("status") != "ok":
+        return {"ok": False, "status": res.get("status"), "message": res.get("message"), "items": []}
+    items, closed = [], 0
+    for p in res.get("data", []) or []:
+        if (p.get("exchange") or "").upper() not in _FNO_EXCHANGES:
+            continue
+        qty = p.get("quantity") or 0
+        if not qty:
+            # Upstox keeps a row for every contract traded today, including the
+            # ones squared off — net quantity 0. Those are not open positions and
+            # must not render as one; counted, not listed.
+            closed += 1
+            continue
+        items.append({
+            "symbol": p.get("trading_symbol") or p.get("tradingsymbol") or "",
+            "qty": qty,
+            # Upstox has no side field: the sign of the net quantity is it.
+            "side": "LONG" if qty > 0 else "SHORT",
+            "avg": p.get("average_price"),
+            "ltp": p.get("last_price"),
+            "pnl": p.get("pnl"),
+            "product": p.get("product"),
+            "exchange": p.get("exchange"),
+        })
+    return {"ok": True, "status": "ok", "items": items, "closed": closed}
+
+async def positions(req):
+    """GET only — see the Route entry. There is no write path for this data."""
+    return JSONResponse(await run(_cached_call, "positions", _positions, 30))
 
 
 # ======================================================================
@@ -1020,6 +1229,10 @@ async def history(req):
         return JSONResponse({"ok": True, "series": {}})
     # Cap the fan-out: a table renders at most a screenful of rows.
     symbols = tuple(dict.fromkeys(s.strip().upper() for s in raw.split(",") if s.strip()))[:200]
+    # `?symbols=,` is non-empty but parses to nothing — the ohlc branch below
+    # indexes [0] and would raise IndexError.
+    if not symbols:
+        return JSONResponse({"ok": True, "series": {}})
     days = max(2, min(400, int(req.query_params.get("days") or 30)))
 
     # ohlc=1 returns candlesticks for a single symbol (F&O index chart);
@@ -1193,7 +1406,10 @@ routes = [
     Route("/api/data-health", data_health),
     Route("/api/events", events),
     Route("/api/fno/{index}", fno),
+    Route("/api/fno/{index}/expiries", fno_expiries),
+    Route("/api/fno/{index}/term", fno_term),
     Route("/api/fno/{index}/narrative", fno_narrative_route),
+    Route("/api/fno/{index}/oi-read", fno_oi_read_route),
     Route("/api/ai", ai, methods=["POST"]),
     Route("/api/ai/stream", ai_stream, methods=["POST"]),
     Route("/api/brief", brief),
@@ -1206,6 +1422,9 @@ routes = [
     Route("/api/watchlists/{id}/items", watchlist_add_symbol, methods=["POST"]),
     Route("/api/watchlists/{id}/items/{symbol}", watchlist_remove_symbol, methods=["DELETE"]),
     Route("/api/holdings", holdings),
+    # methods=["GET"] is explicit and load-bearing: this account-scoped route is
+    # read-only by design and must reject every write verb with a 405.
+    Route("/api/positions", positions, methods=["GET"]),
     Route("/api/history", history),
     Route("/api/ensure", ensure_fresh),
     Route("/api/portfolio/curve", portfolio_curve),
@@ -1214,6 +1433,8 @@ routes = [
     Route("/api/system/status", system_status),
     Route("/api/ingestion/status", ingestion_status),
     Route("/api/ingestion/run", ingestion_run, methods=["POST"]),
+    # /api/udf/{config,symbols,search,history,time} — the TradingView datafeed.
+    *udf_routes,
     WebSocketRoute("/ws", ws_endpoint),
 ]
 
@@ -1258,14 +1479,27 @@ def _catch_up_prices() -> None:
     never blocked on the network; it's a no-op when nothing is behind.
     """
     def work():
+        log = logging.getLogger("api.server")
+        target = None
         try:
             from ingestion.quotes import catch_up
             res = catch_up()
+            target = res.get("target")
             if res.get("symbols"):
-                logging.getLogger("api.server").info(f"price catch-up: {res}")
-                _cache.pop("__universe__", None)   # stale prices are cached; drop them
+                log.info(f"price catch-up: {res}")
+                # @cached(60) keys by fn.__name__ + repr(args) — "__universe__"
+                # is the prewarm label, never a key that was actually written.
+                _cache.pop("_universe()", None)   # stale prices are cached; drop them
         except Exception as e:
-            logging.getLogger("api.server").warning(f"price catch-up failed: {e}")
+            log.warning(f"price catch-up failed: {e}")
+        # Index candles ride a separate cron (20:45) and fell behind the same
+        # way — the F&O chart then draws its levels above a two-session-old
+        # candle and looks broken. Same thread, so boot stays non-blocking.
+        try:
+            from ingestion import index_history
+            log.info(f"index catch-up: {index_history.catch_up(target)}")
+        except Exception as e:
+            log.warning(f"index catch-up failed: {e}")
 
     _REFRESH_POOL.submit(work)
 

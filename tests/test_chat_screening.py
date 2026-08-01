@@ -12,6 +12,8 @@ but almost no fundamentals — so they must assert the shape of the block, never
 which particular columns a given sector happens to populate.
 """
 
+import pytest
+
 from agent.chat import (extract_symbols, route_intent, screen_display,
                         screen_facts, screen_group)
 
@@ -27,6 +29,7 @@ def test_list_questions_route_to_screen():
         assert route_intent(q, extract_symbols(q)) == "screen", q
 
 
+@pytest.mark.needs_data
 def test_a_named_deep_dive_still_wins_over_screening():
     # "Do a deep dive on Infosys" must not become a sector list just because
     # the IT group is nameable from the word "Infosys"... it isn't, but guard
@@ -66,6 +69,7 @@ def test_more_specific_group_wins():
 
 # --- grounding --------------------------------------------------------
 
+@pytest.mark.needs_data
 def test_screen_grounds_on_real_constituents():
     out = screen_facts("Show me pharma stocks")
     assert out, "screen produced no grounding block"
@@ -88,6 +92,7 @@ def _table(block: str) -> tuple[list[str], list[list[str]]]:
     return head, body
 
 
+@pytest.mark.needs_data
 def test_every_printed_column_carries_at_least_one_value():
     # A column of nothing but "n/a" costs prompt space and says nothing. Which
     # columns qualify depends on what has been ingested, so assert the rule
@@ -100,6 +105,7 @@ def test_every_printed_column_carries_at_least_one_value():
             assert any(row[i] != "n/a" for row in body), f"{col!r} is empty in {q!r}"
 
 
+@pytest.mark.needs_data
 def test_absent_columns_are_declared_rather_than_silently_dropped():
     block = screen_facts("Show me pharma stocks")
     head, _ = _table(block)
@@ -109,6 +115,7 @@ def test_absent_columns_are_declared_rather_than_silently_dropped():
             assert col in head or col in declared, f"{col} vanished without a word"
 
 
+@pytest.mark.needs_data
 def test_display_table_is_the_heading_and_rows_only():
     # The figures the user reads come from the DB, not re-typed by the model.
     block = screen_facts("Show me pharma stocks")
@@ -128,6 +135,7 @@ def test_display_table_survives_a_block_with_no_footer():
     assert screen_display("") == ""
 
 
+@pytest.mark.needs_data
 def test_a_ranking_nobody_can_compute_is_disclosed():
     # Ranking by an all-null column silently degrades to default order while
     # the heading still says "ranked by lowest P/E". Whether P/E is populated

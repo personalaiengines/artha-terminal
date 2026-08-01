@@ -83,3 +83,24 @@ def test_tick_for_unsubscribed_key_does_not_reach_client():
         msg = ws.receive_json()
 
     assert msg["key"] == "NSE_INDEX|Nifty 50"
+
+
+def test_subscribe_cap_bounds_the_connection_not_the_frame():
+    """The cap used to slice the incoming list, which bounded nothing: the real
+    client subscribes one symbol per frame (web/lib/use-live-prices.ts), so
+    N frames still grew the connection's set without limit.
+    """
+    from api.ws import _MAX_KEYS
+
+    app = _fresh_app()
+    with TestClient(app).websocket_connect("/ws") as ws:
+        # One key per frame, well past the cap — the shape the real client uses.
+        for i in range(_MAX_KEYS + 50):
+            ws.send_json({"action": "subscribe", "keys": [f"NSE_EQ|SYM{i:05d}"]})
+
+        import time
+        time.sleep(0.2)
+
+        held = next(iter(manager.clients.values()))
+
+    assert len(held) <= _MAX_KEYS, f"connection grew to {len(held)}, cap is {_MAX_KEYS}"

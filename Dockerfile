@@ -46,7 +46,6 @@ COPY --chown=artha:artha api/ ./api/
 COPY --chown=artha:artha scripts/ ./scripts/
 
 ENV ARTHA_DB_PATH=/data/db/artha.db \
-    ARTHA_DATA_DIR=/data \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

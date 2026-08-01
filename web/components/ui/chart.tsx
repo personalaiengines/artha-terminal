@@ -57,13 +57,19 @@ export function AreaPrice({
 // Several series on one set of axes, for comparing things measured in
 // different units (index levels rebased to a common start). Distinct from
 // AreaPrice, which is deliberately single-series and gradient-filled.
+// `baseline` and `tooltipFmt` default to the rebased-index reading this was
+// built for (baseline 100, tooltip as % from it). Pass baseline={null} and a
+// tooltipFmt for a series measured in its own units — IV points, P/L.
 export function MultiLine({
   data, series, xKey = "t", height = 260,
   valueFmt = (v: number) => v.toFixed(1),
+  baseline = 100,
+  tooltipFmt = (v: number) => `${v - 100 >= 0 ? "+" : ""}${(v - 100).toFixed(2)}%`,
 }: {
   data: Record<string, unknown>[];
   series: { key: string; label: string; color: string }[];
   xKey?: string; height?: number; valueFmt?: (v: number) => string;
+  baseline?: number | null; tooltipFmt?: (v: number) => string;
 }) {
   return (
     <ResponsiveContainer width="100%" height={height}>
@@ -72,8 +78,8 @@ export function MultiLine({
         <XAxis dataKey={xKey} {...AXIS} minTickGap={48} />
         <YAxis {...AXIS} domain={["auto", "auto"]} width={44} orientation="right"
                tickFormatter={(v) => valueFmt(Number(v))} />
-        {/* The rebase baseline: above it the index is up over the window. */}
-        <ReferenceLine y={100} stroke="var(--color-line)" strokeDasharray="3 3" />
+        {baseline !== null &&
+          <ReferenceLine y={baseline} stroke="var(--color-line)" strokeDasharray="3 3" ifOverflow="extendDomain" />}
         <Tooltip
           cursor={{ stroke: "var(--color-muted)", strokeDasharray: "3 3" }}
           content={({ active, payload, label }) =>
@@ -85,7 +91,7 @@ export function MultiLine({
                     <span className="h-2 w-2 rounded-full" style={{ background: p.color as string }} />
                     <span className="text-mist">{series.find((s) => s.key === p.dataKey)?.label}</span>
                     <span className="ml-auto font-semibold text-frost tnum">
-                      {(Number(p.value) - 100) >= 0 ? "+" : ""}{(Number(p.value) - 100).toFixed(2)}%
+                      {p.value == null ? "—" : tooltipFmt(Number(p.value))}
                     </span>
                   </div>
                 ))}

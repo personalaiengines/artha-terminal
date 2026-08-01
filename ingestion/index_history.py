@@ -23,6 +23,10 @@ INDEX_TICKERS = {
     "NIFTY": "^NSEI",
     "BANKNIFTY": "^NSEBANK",
     "SENSEX": "^BSESN",
+    # India VIX. A bare VIX number says nothing without its own distribution
+    # behind it, and nothing anywhere stored one; it rides the same loop, the
+    # same table and the same /api/history shape. Volume is always 0.
+    "INDIAVIX": "^INDIAVIX",
 }
 
 
@@ -81,4 +85,46 @@ def run(period: str = "1y") -> dict:
     return {"status": "success", **stats}
 
 
-__all__ = ["run", "INDEX_TICKERS"]
+def catch_up(target: str | None = None, period: str = "1mo") -> dict:
+    """Re-run the index ingest if it missed its cron window.
+
+    APScheduler never replays a fire the process was down for, so a restart
+    spanning 20:45 IST skipped that evening permanently — two consecutive
+    rebuilds left the index candles two sessions behind the equities while the
+    job itself reported nothing wrong. Same self-healing idea as
+    ingestion.quotes.catch_up, and `run` is INSERT OR REPLACE, so re-running is
+    free.
+
+    `target` is the session we should already hold; callers that just computed
+    it (api.server passes it straight from the quotes catch-up) save a second
+    Upstox round-trip. NOT ingestion.quotes.latest_trading_date() — that reads
+    MAX(date) of these very index symbols, so comparing against it would always
+    say "up to date". Falling back on the newest date in prices_daily as a
+    whole catches exactly the observed case: equities current, indices behind.
+    """
+    if not target:
+        try:
+            from services import live_quotes
+            if live_quotes.available():
+                import asyncio
+                target = asyncio.run(live_quotes.session_date())
+        except Exception as e:
+            logger.debug(f"upstox session date unavailable: {e}")
+
+    with get_connection() as conn:
+        have = conn.execute(
+            "SELECT MAX(date) d FROM prices_daily WHERE symbol = 'NIFTY'"
+        ).fetchone()["d"]
+        if not target:
+            target = conn.execute("SELECT MAX(date) d FROM prices_daily").fetchone()["d"]
+
+    if not target:
+        return {"status": "skipped", "reason": "no trading date to compare against"}
+    if have and have >= target:
+        return {"status": "success", "up_to_date": True, "target": target, "have": have}
+
+    logger.info(f"index candles at {have}, behind {target} - backfilling")
+    return {**run(period=period), "target": target, "was": have}
+
+
+__all__ = ["run", "catch_up", "INDEX_TICKERS"]

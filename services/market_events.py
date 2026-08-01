@@ -27,6 +27,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from agent.prompts import COMPLIANCE, GROUNDING, HOUSE_STYLE
+
+_SYSTEM = (
+    f"{GROUNDING}\n\n{HOUSE_STYLE}\n\n{COMPLIANCE}\n\n"
+    "You extract scheduled economic events from the web search results you were "
+    "given. Return ONLY a JSON array — no prose, no preamble."
+)
+
 
 
 # ------------------------------------------------------------------
@@ -223,13 +231,7 @@ def _nim_extract(prompt: str, timeout: float = 40.0) -> str:
     from agent.llm_client import complete
 
     # "quick": structured extraction from pre-fetched snippets, short JSON out.
-    return complete(
-        "You extract scheduled economic events from web search results. "
-        "Return ONLY a JSON array. Never invent events or dates not present "
-        "in the provided results.",
-        prompt,
-        task_shape="quick",
-    )
+    return complete(_SYSTEM, prompt, task_shape="quick")
 
 
 def _parse_ai_events(raw: str, region: str | None, days_ahead: int) -> list[dict]:

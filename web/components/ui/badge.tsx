@@ -26,7 +26,7 @@ export function Badge({
 }
 
 const RATING_TONE: Record<string, Tone> = {
-  "Strong Buy": "up", Buy: "up", Hold: "warn", Reduce: "down", Sell: "down",
+  WATCH: "up", HOLD: "warn", REVIEW: "down",
 };
 export function RatingBadge({ rating }: { rating: string | null | undefined }) {
   // No score computed for this symbol -> no rating. Render a muted dash rather

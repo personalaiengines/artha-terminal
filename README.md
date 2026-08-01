@@ -25,6 +25,14 @@ docker compose up -d          # builds both images on first run
 # api  http://localhost:8000/api/health
 ```
 
+**Open the terminal on the Docker host.** No API route is authenticated —
+`/api/holdings` returns the real brokerage book — so the API is published on
+`127.0.0.1:8000` only. The web container still reaches it as `api:8000` over the
+compose network, but a browser on another LAN device cannot: the tick
+WebSocket is dialled straight from the page (`web/lib/use-ws.ts`), so such a
+device loses live prices and silently falls back to REST polling. Widening this
+means adding real authentication first.
+
 First boot creates the SQLite schema in the `artha-db` volume and starts the
 scheduler. To populate data:
 
@@ -137,6 +145,7 @@ Also read: `ARTHA_DB_PATH` (set to `/data/db/artha.db` in compose),
 artha-terminal/
 ├── api/
 │   ├── server.py          # every REST route, SWR caching, lifespan, error handler
+│   ├── udf.py             # UDF datafeed for the charts (OHLC only, no secrets)
 │   └── ws.py              # /ws tick fan-out to browsers
 │
 ├── agent/                 # AI analyst
@@ -176,7 +185,9 @@ artha-terminal/
 │   ├── data_health.py     # which feeds are live, and what is served if not
 │   ├── last_good.py       # last-known-good persistence
 │   ├── live_quotes.py, stock_data.py, instruments.py, freshness.py
-│   ├── fno_service.py, fno_analysis.py, fno_narrative.py, levels.py
+│   ├── fno_service.py, fno_analysis.py, fno_narrative.py, fno_oi_read.py
+│   ├── levels.py          # pivots, CPR, Camarilla, prior week — settled OHLC only
+│   ├── intraday.py        # 1-minute bar store + resampler (5/15/60)
 │   ├── institutional_flows.py, market_news.py, finnhub_news.py
 │   ├── market_events.py, search.py, yahoo.py, stock_analysis_llm.py
 │   └── tradingview_bridge.py   # optional TradingView Desktop CDP bridge
@@ -187,10 +198,12 @@ artha-terminal/
 │   │                      # ingestion_runs, fii_dii_flows, shareholding,
 │   │                      # agent_cache, search_cache, audit_log,
 │   │                      # alerts, watchlists, watchlist_items
+│   │                      # (the complete list — init_database() replays
+│   │                      #  this file on every start, all IF NOT EXISTS)
 │   └── __init__.py        # get_connection(), init_database(), migrations
 │
 ├── web/                   # Next.js UI — see web/README.md
-├── tests/                 # 27 files, run with pytest
+├── tests/                 # 38 files, run with pytest
 ├── scripts/               # ingest_all.py, backfills, ws_smoke.py, F&O draw scripts
 └── archive/streamlit-legacy/   # the retired Streamlit app
 ```
@@ -208,7 +221,16 @@ commodities) · `/api/flows` · `/api/news` · `/api/events` · `/api/brief`
 
 **Stock** — `/api/stock/{symbol}` · `/api/stock/{symbol}/analysis` · `/api/history`
 
-**F&O** — `/api/fno/{index}` · `/api/fno/{index}/narrative`
+**F&O** — `/api/fno/{index}` (game plan: spot, ATM, PCR, max pain, level zones) ·
+`/api/fno/{index}/narrative` · `/api/fno/{index}/expiries` ·
+`/api/fno/{index}/term` (ATM IV term structure) · `/api/fno/{index}/oi-read` ·
+`/api/positions`
+
+**Charts** — `/api/udf/config` · `/api/udf/symbols` · `/api/udf/search` ·
+`/api/udf/history` · `/api/udf/time`. A UDF datafeed (the TradingView wire
+contract) serving the 1-minute store, resampled to 5/15/60 server-side. The F&O
+chart reads `/history` through a same-origin Next.js proxy; a range with no bars
+answers `no_data`, never an interpolated candle.
 
 **AI** — `/api/ai` (one-shot) · `/api/ai/stream` (SSE, used by the analyst page)
 
@@ -362,8 +384,108 @@ pytest tests/ -q                 # host, against the dev DB
 make test                        # inside the container, against the live DB
 ```
 
-27 test files. Tests that read the DB assert the *shape* of a result, not
-specific values, because the two databases hold different data.
+38 test files, 262 tests. Tests that read the DB assert the *shape* of a result,
+not specific values, because the two databases hold different data.
+
+The web side has no test runner (adding one to assert a handful of pure
+functions would cost more than the functions). The non-trivial browser logic
+instead carries `assert`-based self-checks that compile and run with the `tsc`
+already installed:
+
+```bash
+cd web
+npx tsc lib/indicators.ts lib/indicators.check.ts lib/live-bar.ts lib/live-bar.check.ts         lib/chart-store.ts lib/chart-store.check.ts         --outDir .checkout --module commonjs --target es2022 --strict
+node .checkout/indicators.check.js && node .checkout/live-bar.check.js && node .checkout/chart-store.check.js
+```
+
+---
+
+## The F&O chart
+
+The centre of the F&O page: price against the level map, on
+[KLineChart](https://klinecharts.com) (Apache-2.0, on npm). It replaced a
+lightweight-charts build for one reason — that library ships **no user drawing
+tools**, so trendlines and Fibonacci had to be hand-coded onto it.
+
+### What it draws, and where each number comes from
+
+| Layer | Source |
+|---|---|
+| Daily bars | `/api/history` — the page's own fetch, 1Y by default |
+| Intraday bars (1m/5m/15m/1h) | `/api/udf/history` — the 1-minute store, resampled server-side |
+| Live movement | the shared Upstox tick socket, folded into the last bar |
+| Level map | `/api/fno/{index}` — the same confluence zones the Level Map card lists |
+
+Nothing here invents a bar. An empty response draws an empty chart with the
+reason written beside it; a tick never opens a daily bar the store has not
+published; streamed bars carry `volume: 0` because the tape streams no volume —
+0 is the measurement, not a placeholder.
+
+### Levels
+
+Twelve level types, every one arithmetic on settled OHLC or the live option
+chain — no forecast, no smoothing:
+
+| From the option chain | From settled price |
+|---|---|
+| Call OI Wall, Put OI Wall | Classic pivots (P, R1/R2, S1/S2) |
+| Max Pain | CPR (top / bottom) |
+| Expected-move band (ATM straddle) | Camarilla H3 / L3 |
+| | Prev Day High / Low / Close |
+| | Prev Week High / Low |
+
+Levels within 0.15% of each other **merge into one zone** — "Max Pain + CPR
+Bottom + Pivot P + Prev Day Close" is one line four independent methods agree
+on, which is what the 0-100 zone strength scores. Support and resistance are
+re-derived from spot on every build, so a broken resistance becomes the next
+support and is drawn `BROKEN` rather than quietly relabelled.
+
+The picker (sliders button, or `S`) filters them: per line, or **Show all /
+Hide all / Still holding / Close to price**. `L` hides the whole map.
+
+### Reading it without a mouse
+
+A canvas is invisible to a screen reader and unreachable by Tab, so the chart is
+`role="application"`, focusable, and driven by the keyboard. `←`/`→` walk a read
+cursor bar by bar; every stop draws a marker and announces one `aria-live`
+sentence — shown on screen and read aloud:
+
+> `7 Jul 11:45 IST · open 24,510.45 · high 24,528 · low 24,503.05 · close 24,524.6 · up 0.06% on the bar · nearest level Pivot R2 at 24,500.6, 0.10% below · bar 61 of 525`
+
+The nearest level is in there deliberately: OHLC alone is not a reading of *this*
+chart — price against the level map is what the page is for.
+
+| Key | Does |
+|---|---|
+| `← →` | step the cursor one bar (`Shift`: ten) |
+| `Home` / `End` | first / last bar |
+| `+` / `−` | zoom |
+| `R` | reset the view (or double-click the price axis) |
+| `1`…`5` | 1m, 5m, 15m, 1h, 1D |
+| `L` / `S` | hide the level map / pick lines |
+| `I` / `?` | indicator guide / shortcut list |
+| `F` / `Esc` | expand to the window / unwind |
+
+### Indicators
+
+MA, EMA, Bollinger, RSI, MACD, KDJ and Volume are KLineChart built-ins. **VWAP**
+is registered from `web/lib/indicators.ts` rather than reimplemented, and **TWAP**
+(time-weighted, volume-free) exists because the index intraday feed publishes no
+volume at all — so VWAP is gated to daily bars and says why, instead of drawing a
+line over zeros. On daily bars both anchor **once** across the loaded window; a
+per-session anchor there would redraw each bar's own typical price.
+
+`I` opens a guide with what each one measures, how it is read, and what it will
+not tell you ("RSI can pin above 70 for weeks in a trend; it measures speed, not
+direction"), plus plain-English definitions of every level type.
+
+### Drawing tools
+
+Horizontal line, trend line, ray, vertical, Fibonacci retracement and price
+channel, with magnet snapping to OHLC values, undo, and clear-all. Drawings and
+the whole toolbar setup **persist in `localStorage`**, drawings per index.
+Anchors are timestamp + price only — never `dataIndex`, which is a position in
+the current view — so a line drawn on 15m sits on the same prices on 1D.
 
 ---
 
@@ -383,6 +505,58 @@ Consult a SEBI-registered investment advisor before making investment decisions.
 ---
 
 ## Changelog
+
+### 2026-08-01
+
+The F&O chart rebuilt on KLineChart, and the level engine widened. Full
+description under [The F&O chart](#the-fo-chart).
+
+**New**
+
+- **Charting moved to KLineChart** (Apache-2.0). The old lightweight-charts
+  build had no drawing tools — the library ships none. Now: six drawing tools
+  with magnet snapping, nine indicators, and confluence **zone bands** (a zone
+  is a range; the previous library had no band primitive, so only its edges
+  could be drawn).
+- **Seven more levels for daily F&O** — CPR top/bottom, Camarilla H3/L3, prev
+  day close, prev week high/low. All from the one yfinance fetch already made,
+  all pure arithmetic on settled OHLC. NIFTY went from 8 zones to 10, with
+  five methods now agreeing on the max-pain price.
+- **Keyboard-operable, screen-reader-readable chart** — a read cursor that walks
+  bars and announces each one, including the nearest level and the distance to
+  it. Full shortcut set, expand-to-window, and a `?` sheet rendered from the same
+  table the handler uses, so the two cannot drift.
+- **Indicator guide and level glossary** in the page (`I`) — what each measures,
+  how it is read, and what it does not tell you.
+- **Drawings and chart setup persist** in `localStorage`, per index, anchored to
+  timestamp + price.
+- **UDF datafeed** (`api/udf.py`) serving the 1-minute store with 5/15/60
+  resampled server-side; a range with no bars answers `no_data`, never a
+  fabricated candle.
+
+**Fixed**
+
+- **The price axis was dead where the levels were.** Level tags were drawn with
+  the library's `simpleTag`, whose y-axis figure consumes mouse events — with
+  eight levels stacked around spot, the top ~40% of the axis could not be
+  dragged or touched. Replaced with an event-transparent tag; `R` and a
+  double-click now also reset a scale dragged into a corner.
+- **A late tick could open a 22:00 candle on a closed market.** Ticks now carry
+  the exchange's own `ltt` rather than the browser clock, and an intraday bar is
+  never opened outside 09:15–15:30 IST. A settled bar stays settled.
+- **VWAP on daily bars measured nothing** — it re-anchored every bar, making it
+  that bar's own typical price. Anchored once across the window now, and the note
+  under the chart says so.
+- **A resolution switch fed the new series in one bar at a time** at the previous
+  resolution's bar width: the empty payload shown while loading was claiming the
+  cache key. Also, 22 daily bars used to render into the right quarter of an
+  otherwise empty pane.
+- **Axis tick text was under WCAG AA** (~3:1). Now ~8:1, with black-on-white
+  crosshair labels.
+- **`.env.bak.*` was neither tracked nor ignored** — a real backup full of live
+  keys sat one `git add -A` away from being published. `.gitignore` now ignores
+  every `.env` variant and un-ignores only `.env.example`. Nothing secret ever
+  reached the history.
 
 ### 2026-07-29
 
@@ -453,12 +627,10 @@ MIT
 Two independent paths to see support/resistance, max-pain, OI-wall and pivot
 levels on a live chart.
 
-**Path 1 — in the app (default).** The F&O page renders candles with the levels
-overlaid. `services/fno_service.py` provides `get_index_intraday()` (today's
-forming session, which the historical endpoint won't return) and
-`get_index_history()`, which pages Upstox's capped windows (1-minute = 25 days,
-30-minute = 150 days per request) and stitches them, so fine intervals still
-span about a year.
+**Path 1 — in the app (default).** [`web/components/widgets/kline-chart.tsx`](web/components/widgets/kline-chart.tsx),
+built on [KLineChart](https://klinecharts.com) (Apache-2.0), documented in full
+under **The F&O chart** below. Levels, drawing tools, indicators and live ticks
+in the page itself — no external app, no licence to apply for.
 
 **Path 2 — TradingView Desktop bridge (optional).** Draws the same levels on the
 real TradingView app over the Chrome DevTools Protocol. Genuinely tick-live,

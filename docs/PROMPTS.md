@@ -11,11 +11,13 @@ rules exist to prevent (see §7).
 
 ## 1. Providers and keys
 
-Five providers are wired. All are free-tier by design; the router falls through
+Seven providers are wired. All are free-tier by design; the router falls through
 on rate limits rather than failing.
 
 | Provider | Endpoint | Key (`.env`) | Configured now |
 |---|---|---|---|
+| Groq | `api.groq.com/openai/v1/chat/completions` | `GROQ_API_KEY` | set |
+| Google Gemini | `generativelanguage.googleapis.com/v1beta/openai/chat/completions` | `GOOGLE_API_KEY` | set |
 | OpenRouter | `openrouter.ai/api/v1/chat/completions` | `OPENROUTER_API_KEY` | set |
 | Nvidia NIM | `integrate.api.nvidia.com/v1/chat/completions` | `NVIDIA_API_KEY` | set |
 | SambaNova | `api.sambanova.ai/v1/chat/completions` | `SAMBANOVA_API_KEY` | set |
@@ -28,10 +30,12 @@ Defaults live in `config.py`; `.env` overrides them. Current values:
 
 | Setting | Value | Provider |
 |---|---|---|
+| `GROQ_MODEL` | `openai/gpt-oss-120b` (131K ctx) | Groq |
+| `GOOGLE_MODEL` | `gemini-flash-latest` | Google Gemini |
 | `OPENROUTER_PRIMARY_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter |
 | `OPENROUTER_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
-| `NVIDIA_FALLBACK_MODEL` | `meta/llama-3.1-405b-instruct` | Nvidia NIM |
-| `NVIDIA_BACKUP_MODEL` | `meta/llama-3.3-70b-instruct` | Nvidia NIM |
+| `NVIDIA_FALLBACK_MODEL` | `mistralai/mistral-nemotron` | Nvidia NIM |
+| `NVIDIA_BACKUP_MODEL` | `deepseek-ai/deepseek-v4-pro` | Nvidia NIM |
 | `SAMBANOVA_MODEL` | `Meta-Llama-3.3-70B-Instruct` | SambaNova |
 | `GITHUB_MODELS_MODEL` | `Llama-3.3-70B-Instruct` | GitHub Models |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | Anthropic (unused) |
@@ -54,23 +58,40 @@ are included.
 **`task_shape="quick"`** — short prompts, latency matters:
 
 ```
-1. SambaNova       Meta-Llama-3.3-70B-Instruct        SAMBANOVA_API_KEY
-2. OpenRouter      nemotron-3-ultra-550b-a55b:free    OPENROUTER_API_KEY
-3. OpenRouter      nemotron-3-super-120b-a12b:free    OPENROUTER_API_KEY
-4. Nvidia NIM      meta/llama-3.1-405b-instruct       NVIDIA_API_KEY
-5. Nvidia NIM      meta/llama-3.3-70b-instruct        NVIDIA_API_KEY
+1. Groq            openai/gpt-oss-120b                GROQ_API_KEY
+2. Google Gemini   gemini-flash-latest                GOOGLE_API_KEY
+3. SambaNova       Meta-Llama-3.3-70B-Instruct        SAMBANOVA_API_KEY
+4. OpenRouter      nemotron-3-ultra-550b-a55b:free    OPENROUTER_API_KEY
+5. OpenRouter      nemotron-3-super-120b-a12b:free    OPENROUTER_API_KEY
+6. Nvidia NIM      mistralai/mistral-nemotron         NVIDIA_API_KEY
+7. Nvidia NIM      deepseek-ai/deepseek-v4-pro        NVIDIA_API_KEY
 ```
 
 **`task_shape="deep"`** — long context, multi-section output:
 
 ```
-1. GitHub Models   Llama-3.3-70B-Instruct  (128K ctx)  GITHUB_MODELS_TOKEN
-2. OpenRouter      nemotron-3-ultra-550b-a55b:free     OPENROUTER_API_KEY
-3. OpenRouter      nemotron-3-super-120b-a12b:free     OPENROUTER_API_KEY
-4. Nvidia NIM      meta/llama-3.1-405b-instruct        NVIDIA_API_KEY
-5. Nvidia NIM      meta/llama-3.3-70b-instruct         NVIDIA_API_KEY
-6. SambaNova       Meta-Llama-3.3-70B-Instruct         SAMBANOVA_API_KEY
+1. Groq            openai/gpt-oss-120b  (131K ctx)     GROQ_API_KEY
+2. Google Gemini   gemini-flash-latest                 GOOGLE_API_KEY
+3. GitHub Models   Llama-3.3-70B-Instruct  (128K ctx)  GITHUB_MODELS_TOKEN
+4. OpenRouter      nemotron-3-ultra-550b-a55b:free     OPENROUTER_API_KEY
+5. OpenRouter      nemotron-3-super-120b-a12b:free     OPENROUTER_API_KEY
+6. Nvidia NIM      mistralai/mistral-nemotron          NVIDIA_API_KEY
+7. Nvidia NIM      deepseek-ai/deepseek-v4-pro         NVIDIA_API_KEY
+8. SambaNova       Meta-Llama-3.3-70B-Instruct         SAMBANOVA_API_KEY
 ```
+
+Groq leads both chains and Google follows it: probed live 2026-07-30 they answer
+in ~1.0-1.6s against 7-30s for the NIM rungs, both call tools correctly, and their
+free quotas are independent of each other and of OpenRouter. Check any rung
+yourself with `python scripts/ai_check.py models`, which prints
+provider/model -> status, latency and tool support for every configured tier.
+
+Three rungs were removed on 2026-07-30 because they were dead, not merely slow:
+`meta/llama-3.1-405b-instruct` (HTTP 404, retired), `meta/llama-3.3-70b-instruct`
+(no answer inside 70s) and `qwen/qwen3-next-80b-a3b-instruct` (HTTP 410 Gone,
+which `.env.example` had been recommending). NIM latency is also unstable — the
+same model measured 0.6s and then a 60s timeout minutes apart — so NIM sits at the
+bottom of both chains and no rung should be ranked on a single measurement.
 
 SambaNova appears at both ends of the deep chain: it is a separate free quota
 pool from OpenRouter and NIM, so it is worth keeping as a last resort. When

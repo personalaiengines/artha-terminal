@@ -18,13 +18,29 @@ export async function POST(req: Request) {
   const q = (body?.q ?? "").toString().trim();
   if (!q) return NextResponse.json({ ok: false, error: "empty query" });
   const res = await sendApi<any>("/api/ai", "POST", { q }, 170000);
-  if (!res || res.ok === false || !res.answer) return NextResponse.json({ ok: false });
+  if (!res || res.ok === false || !res.answer) {
+    // Pass the reason through. This used to collapse every failure to a bare
+    // {ok:false}, which the page renders as its scripted demo answer — so a real
+    // outage, an over-length question and a model returning nothing were all
+    // indistinguishable from a genuine reply. The Python side now sends
+    // error/detail (e.g. "empty_answer"); surface it.
+    return NextResponse.json({
+      ok: false,
+      error: res?.error ?? "unavailable",
+      detail: res?.detail ?? null,
+    });
+  }
   return NextResponse.json({
     ok: true,
     answer: res.answer,
     symbol: res.symbol ?? null,
     cards: res.cards ?? (res.symbol ? [res.symbol] : []),
-    sources: (res.tools ?? []).length ? res.tools : ["ARTHA Agent", "Screener.in", "Upstox"],
+    // Only the tools actually used. The fallback here used to be a hard-coded
+    // ["ARTHA Agent", "Screener.in", "Upstox"] whenever the agent reported no
+    // tools — inventing provenance for an answer, and claiming two data vendors
+    // that were never consulted. That is precisely what GROUNDING forbids of the
+    // model, so the UI must not do it either. No tools used, no sources shown.
+    sources: res.tools ?? [],
     model: res.model ?? null,
   });
 }

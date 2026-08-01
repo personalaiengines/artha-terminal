@@ -35,7 +35,7 @@ function StocksScreener() {
   const rows = universe.filter((s) => {
     if (sector && s.sector !== sector) return false;
     if (q && !(`${s.symbol} ${s.name}`.toLowerCase().includes(q.toLowerCase()))) return false;
-    if (seg === "buy") return s.aiRating === "Strong Buy" || s.aiRating === "Buy";
+    if (seg === "watch") return s.aiRating === "WATCH";
     if (seg === "gainers") return (s.changePct ?? 0) > 0;
     if (seg === "losers") return (s.changePct ?? 0) < 0;
     return true;
@@ -91,7 +91,7 @@ function StocksScreener() {
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter symbols…" className="w-full bg-transparent text-[13px] text-frost outline-none placeholder:text-muted" />
         </div>
         <Segmented value={seg} onChange={setSeg} options={[
-          { label: "All", value: "all" }, { label: "AI Buys", value: "buy" },
+          { label: "All", value: "all" }, { label: "On Watch", value: "watch" },
           { label: "Gainers", value: "gainers" }, { label: "Losers", value: "losers" },
         ]} />
         {sector && (

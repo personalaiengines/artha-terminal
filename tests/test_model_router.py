@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,13 +20,25 @@ from config import config
 from agent.llm_client import ModelRouter, AllTiersExhausted
 
 
-def _configure_all_tiers():
+def _configure_all_tiers(fast_tiers: bool = False):
     config.ai.sambanova_api_key = "sb-key"
     config.ai.github_models_token = "gh-pat"
     config.ai.openrouter_api_key = "or-key"
     config.ai.nvidia_api_key = "nv-key"
     config.ai.anthropic_api_key = None  # keep the opt-in paid path off
-    ModelRouter._cooldown.clear()  # class-level state — reset so tests don't leak into each other
+    
+    # Groq and Google lead both chains in production. Both are OFF by default here
+    # so the tests below keep asserting what they were written to assert — the RELATIVE
+    # preferences further down the chain (quick -> sambanova, deep -> github,
+    # github skipped when tools are attached). Groq's own position is covered by
+    # the two dedicated tests at the end of this file.
+    config.ai.groq_api_key = "groq-key" if fast_tiers else None
+    config.ai.google_api_key = "goog-key" if fast_tiers else None
+    # Class-level state — reset so tests don't leak into each other. The 429
+    # streak matters as much as the cooldown: three leaked 429s would flip the
+    # next test's cooldown from 5 minutes to an hour.
+    ModelRouter._cooldown.clear()
+    ModelRouter._429_streak.clear()
 
 
 def _ok_response(model_id: str):
@@ -153,7 +166,14 @@ async def test_all_tiers_exhausted_raises_distinct_error():
         with pytest.raises(AllTiersExhausted) as exc_info:
             await router.chat([{"role": "user", "content": "hi"}], task_shape="quick")
 
-    assert len(exc_info.value.errors) == 5  # sambanova + 2 openrouter + 2 nvidia rungs
+    # Every configured rung must be tried and reported, whatever the chain length
+    # currently is. This used to hard-code 5; disabling a dead NIM rung then broke
+    # it for the right reason but the wrong assertion. What matters is that the
+    # error names every rung actually attempted, not that there are N of them.
+    expected = config.ai.get_tier_chain("quick")
+    assert len(exc_info.value.errors) == len(expected)
+    for tier in expected:
+        assert any(tier.model in e for e in exc_info.value.errors), f"{tier.model} not reported"
 
 
 class _FakeHTTPError(Exception):
@@ -202,3 +222,105 @@ async def test_rate_limited_tier_cools_down_shorter_than_dead_model():
     key = "openrouter:" + config.ai.primary_model
     remaining = ModelRouter._cooldown[key] - now
     assert 0 < remaining <= 5 * 60 + 5
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    """The real exception raise_for_status() produces — carries .response."""
+    request = httpx.Request("POST", "https://example.test/chat/completions")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+def test_invalid_key_cools_down_for_six_hours():
+    """An expired/revoked key doesn't heal on its own — retrying it every call
+    burns a full round trip forever. Three clients used to raise a bare
+    ValueError on 401, which carries no .response, so _cooldown_seconds could
+    never classify it."""
+    assert ModelRouter._cooldown_seconds(_http_status_error(401)) == 6 * 3600
+    assert ModelRouter._cooldown_seconds(_http_status_error(403)) == 6 * 3600
+
+
+def test_repeated_429_escalates_from_minutes_to_an_hour():
+    """A daily-capped rung (SambaNova, OpenRouter free) 429s identically to a
+    per-minute-capped one (Groq), and neither sends Retry-After. Five minutes is
+    right for the second and wrong for the first, so a streak escalates."""
+    ModelRouter._429_streak.clear()
+    key = "sambanova:test-model"
+    err = _http_status_error(429)
+    assert ModelRouter._cooldown_seconds(err, key) == 5 * 60
+    assert ModelRouter._cooldown_seconds(err, key) == 5 * 60
+    assert ModelRouter._cooldown_seconds(err, key) == 3600, "third strike = capped, not busy"
+
+
+def test_success_clears_the_429_streak():
+    ModelRouter._429_streak.clear()
+    key = "groq:test-model"
+    err = _http_status_error(429)
+    ModelRouter._cooldown_seconds(err, key)
+    ModelRouter._cooldown_seconds(err, key)
+    ModelRouter._429_streak.pop(key, None)  # what a successful call does
+    assert ModelRouter._cooldown_seconds(err, key) == 5 * 60
+
+
+def test_server_error_is_not_cooled_down():
+    """5xx is transient — the next request should still try that tier."""
+    assert ModelRouter._cooldown_seconds(_http_status_error(500)) is None
+
+
+@pytest.mark.asyncio
+async def test_groq_leads_both_chains_when_configured():
+    """Groq is the first rung for quick AND deep once a key is present.
+
+    It was measured at 0.5s against 7-25s for every other rung, carries a 131K
+    context so it suits deep as well as quick, and calls tools correctly. If a
+    future edit demotes it, this fails.
+    """
+    for shape in ("quick", "deep"):
+        _configure_all_tiers(fast_tiers=True)
+        called = []
+
+        async def fake_post(self, url, headers=None, json=None):
+            called.append(url)
+            return _ok_response("groq")
+
+        with patch("httpx.AsyncClient.post", new=fake_post):
+            await ModelRouter().chat([{"role": "user", "content": "hi"}], task_shape=shape)
+
+        assert "api.groq.com" in called[0], f"{shape}: expected groq first, got {called[0]}"
+        assert len(called) == 1, f"{shape}: should short-circuit on the first success"
+
+
+def test_groq_absent_from_chain_without_a_key():
+    """No key must mean no rung — not a rung that tries an empty credential."""
+    _configure_all_tiers(fast_tiers=False)
+    for shape in ("quick", "deep"):
+        assert not any(t.provider == "groq" for t in config.ai.get_tier_chain(shape))
+
+
+@pytest.mark.asyncio
+async def test_google_is_the_second_rung_on_its_own_quota_pool():
+    """Groq leads; Google follows on an independent free quota.
+
+    That ordering is the point: SambaNova and OpenRouter both 429 regularly, so
+    the second rung has to be a provider whose limits are unrelated to the first.
+    """
+    _configure_all_tiers(fast_tiers=True)
+    called = []
+
+    async def fake_post(self, url, headers=None, json=None):
+        called.append(url)
+        if "groq" in url:
+            raise ConnectionError("groq exhausted")
+        return _ok_response(json["model"])
+
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        await ModelRouter().chat([{"role": "user", "content": "hi"}], task_shape="quick")
+
+    assert "api.groq.com" in called[0]
+    assert "generativelanguage.googleapis.com" in called[1], f"expected google second, got {called[1]}"
+
+
+def test_google_absent_from_chain_without_a_key():
+    _configure_all_tiers(fast_tiers=False)
+    for shape in ("quick", "deep"):
+        assert not any(t.provider == "google" for t in config.ai.get_tier_chain(shape))

@@ -26,8 +26,36 @@ class AIConfig:
     provider: str = "openrouter"  # openrouter (free models, primary), nvidia (fallback)
     primary_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     fallback_model_1: str = "nvidia/nemotron-3-super-120b-a12b:free"
-    fallback_model_2: str = "meta/llama-3.1-405b-instruct"
-    fallback_model_3: str = "meta/llama-3.3-70b-instruct"
+    # Both original NIM rungs were dead. Probed live against
+    # integrate.api.nvidia.com on 2026-07-30: meta/llama-3.1-405b-instruct ->
+    # HTTP 404 (retired), qwen/qwen3-next-80b-a3b-instruct (what .env.example
+    # recommended) -> HTTP 410 Gone, meta/llama-3.3-70b-instruct -> no answer
+    # inside 70s. All three could never win a race they were configured to run.
+    #
+    # Replacements chosen by probing the whole catalogue with the app's real
+    # tool-calling prompt, fastest-first (all HTTP 200 with a clean tool_call):
+    #   mistralai/mistral-nemotron            0.6s
+    #   deepseek-ai/deepseek-v4-pro           1.4s
+    #   deepseek-ai/deepseek-v4-flash         8.3s
+    #   nvidia/llama-3.3-nemotron-super-49b   7.3s
+    #   z-ai/glm-5.2                         31.8s   (works, too slow to rank)
+    #   minimaxai/minimax-m3                 31.3s   (and returned no tool_call)
+    # Empty = disabled. A model id goes in only after `scripts/ai_check.py models`
+    # shows it answering.
+    fallback_model_2: str = "mistralai/mistral-nemotron"
+    fallback_model_3: str = "deepseek-ai/deepseek-v4-pro"
+
+    # Groq — fastest rung by an order of magnitude (0.5s vs 7-25s), 131K context,
+    # tool-calling verified. Serves both task shapes, so it leads both chains.
+    groq_api_key: Optional[str] = None
+    groq_model: str = "openai/gpt-oss-120b"
+
+    # Google Gemini free tier, via Google's OpenAI-compatible endpoint. A quota
+    # pool independent of SambaNova/OpenRouter, which both 429 regularly.
+    # Probed live: gemini-flash-latest 3.3s, gemini-flash-lite-latest 0.5s, both
+    # returning proper tool_calls.
+    google_api_key: Optional[str] = None
+    google_model: str = "gemini-flash-latest"
 
     # Direct Anthropic API — OPTIONAL, PAID. Off unless ANTHROPIC_API_KEY is
     # explicitly set; the free tiered chain below is the default path.
@@ -67,15 +95,34 @@ class AIConfig:
     def has_github_models(self) -> bool:
         return bool(self.github_models_token)
 
+    @property
+    def has_groq(self) -> bool:
+        return bool(self.groq_api_key)
+
+    @property
+    def has_google(self) -> bool:
+        return bool(self.google_api_key)
+
     def get_tier_chain(self, task_shape: str = "deep") -> list["TierSpec"]:
         """Ordered free-tier chain to try for a given task shape.
 
+        Groq leads both shapes: measured live it answers in 0.5s against 7-25s
+        for every other rung, carries a 131K context so it suits `deep` as well
+        as `quick`, and calls tools correctly. Everything below it is a fallback
+        for when its free quota runs out.
+
         'quick': small/fast tasks (sentiment tags, curation, debate turns) —
-                 SambaNova first (fast, small context), then the general chain.
+                 then SambaNova (fast, small context), then the general chain.
         'deep':  long-context tasks (report synthesis, full history) —
-                 GitHub Models first (128K context), then the general chain.
+                 then GitHub Models (128K context), then the general chain.
         """
         chain: list[TierSpec] = []
+        if self.has_groq:
+            chain.append(TierSpec("groq", self.groq_model))
+        # Second, on an independent quota pool — the rung most likely to still be
+        # answering when Groq's free allowance runs out.
+        if self.has_google:
+            chain.append(TierSpec("google", self.google_model))
         if task_shape == "quick" and self.has_sambanova:
             chain.append(TierSpec("sambanova", self.sambanova_model))
         if task_shape == "deep" and self.has_github_models:
@@ -90,7 +137,8 @@ class AIConfig:
         # keep it as a last-resort rung (front of chain already covers 'quick').
         if task_shape == "deep" and self.has_sambanova:
             chain.append(TierSpec("sambanova", self.sambanova_model))
-        return chain
+        # A rung with no model id is a disabled rung, not a rung that tries "".
+        return [t for t in chain if t.model]
 
 
 @dataclass
@@ -185,6 +233,10 @@ class Config:
             sambanova_model=os.getenv("SAMBANOVA_MODEL") or AIConfig.sambanova_model,
             github_models_token=os.getenv("GITHUB_MODELS_TOKEN"),
             github_models_model=os.getenv("GITHUB_MODELS_MODEL") or AIConfig.github_models_model,
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            groq_model=os.getenv("GROQ_MODEL") or AIConfig.groq_model,
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            google_model=os.getenv("GOOGLE_MODEL") or AIConfig.google_model,
         )
         self.search = SearchConfig(
             serpapi_key=os.getenv("SERPAPI_KEY"),

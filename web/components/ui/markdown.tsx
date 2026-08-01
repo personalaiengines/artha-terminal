@@ -28,9 +28,14 @@ function inline(text: string, keyBase: string): ReactNode[] {
     if (/^`[^`]+`$/.test(part))
       return <code key={key} className="rounded bg-void/70 px-1.5 py-0.5 font-mono text-[12.5px] text-accent hairline">{part.slice(1, -1)}</code>;
     const link = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    // Hrefs come from model output (and the web snippets fed to it), so the
+    // scheme is attacker-choosable: allowlist http(s), otherwise drop the
+    // anchor and keep only the label text.
     if (link)
-      return <a key={key} href={link[2]} target="_blank" rel="noopener noreferrer"
-        className="text-accent underline decoration-accent/40 underline-offset-2 hover:decoration-accent">{link[1]}</a>;
+      return /^https?:/i.test(link[2])
+        ? <a key={key} href={link[2]} target="_blank" rel="noopener noreferrer"
+            className="text-accent underline decoration-accent/40 underline-offset-2 hover:decoration-accent">{link[1]}</a>
+        : <Fragment key={key}>{link[1]}</Fragment>;
     return <Fragment key={key}>{part}</Fragment>;
   });
 }

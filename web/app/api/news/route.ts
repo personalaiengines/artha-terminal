@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { fromApi } from "@/lib/api-server";
-import { NewsItem } from "@/lib/data";
+import { NewsBriefing, NewsItem, SessionPhase } from "@/lib/data";
 
 const POS = /(surge|jump|gain|rise|beat|record|high|profit|upgrade|rally|boost|strong)/i;
 const NEG = /(fall|drop|slump|loss|miss|cut|weak|decline|plunge|downgrade|fear|slow)/i;
@@ -52,20 +52,36 @@ const BACKEND_CATS: Record<string, NewsItem["category"]> = {
   Macro: "Macro", Policy: "Macro",
 };
 
+// Stable per-article id. The Alerts page stores "already seen" ids in
+// localStorage, so this must not move when the feed re-ranks — hence a hash of
+// the article URL rather than the position in the array.
+function idFor(url: string, headline: string): string {
+  const src = url || headline;
+  let h = 0;
+  for (let i = 0; i < src.length; i++) h = (Math.imul(31, h) + src.charCodeAt(i)) | 0;
+  return `n${(h >>> 0).toString(36)}`;
+}
+
+const REGIONS = new Set(["india", "global"]);
+const IMPACTS = new Set(["high", "medium", "low"]);
+
 // Live LLM-curated market news mapped to the UI NewsItem shape. Sentiment and
-// category are derived here; the headline, one-line "why it matters" and the
-// source URL all come from the backend, which only keeps links it actually saw
-// in the search results.
+// category are derived here; the headline, one-line "why it matters", region,
+// impact and the source URL all come from the backend, which only keeps links
+// it actually saw in the search results.
 export async function GET() {
-  const live = await fromApi<{ items: any[]; generated_ist?: string }>("/api/news", 14000);
+  const live = await fromApi<{
+    items: any[]; generated_ist?: string; briefing?: NewsBriefing | null; phase?: SessionPhase;
+  }>("/api/news", 14000);
   if (!live?.items?.length) return NextResponse.json({ ok: false, items: [] });
 
-  const items: NewsItem[] = live.items.slice(0, 20).map((n, i) => {
+  const items: NewsItem[] = live.items.slice(0, 24).map((n) => {
     const url = n.link ?? n.url ?? "";
-    const text = `${n.title ?? n.headline ?? ""} ${n.snippet ?? n.summary ?? ""}`;
+    const headline = n.title ?? n.headline ?? "Market update";
+    const text = `${headline} ${n.snippet ?? n.summary ?? ""}`;
     return {
-      id: `live-${i}`,
-      headline: n.title ?? n.headline ?? "Market update",
+      id: idFor(url, headline),
+      headline,
       source: url ? publisher(url) : (n.source ?? "Newswire"),
       url,
       sentiment: sentiment(text),
@@ -74,13 +90,19 @@ export async function GET() {
       // fabricated "2h ago" on every card.
       time: live.generated_ist ?? new Date().toISOString(),
       summary: n.snippet ?? n.summary ?? "",
-      tickers: [],
+      tickers: Array.isArray(n.tickers) ? n.tickers.slice(0, 4) : [],
       // Prefer the derived category — Earnings/Sector/Flows/Corporate are
       // finer than anything the curator emits; fall back to its label.
       category: category(text) === "Markets"
         ? (BACKEND_CATS[n.source] ?? "Markets")
         : category(text),
+      region: REGIONS.has(n.region) ? n.region : "india",
+      impact: IMPACTS.has(n.impact) ? n.impact : "low",
     };
   });
-  return NextResponse.json({ ok: true, items });
+  return NextResponse.json({
+    ok: true, items,
+    briefing: live.briefing ?? null,
+    phase: live.phase ?? "post_close",
+  });
 }

@@ -403,7 +403,12 @@ function Answer({ m, uniMap, busy, onFollowUp, onRegenerate }: {
             <summary className="flex cursor-pointer list-none items-center gap-2 px-3.5 py-2.5 text-[12px] font-medium text-muted">
               <ChevronDown size={14} className="transition-transform group-open:rotate-180" />
               <Database size={12} />
-              Grounded in {m.sources?.length ? m.sources.join(", ") : "live data"}
+              {/* Name the sources, or say nothing about grounding. The fallback
+                  here used to read "Grounded in live data" whenever the source
+                  list was empty — asserting provenance for an answer that
+                  reported none, which is the same fabrication GROUNDING forbids
+                  the model. An empty list means we only know the steps taken. */}
+              {m.sources?.length ? `Grounded in ${m.sources.join(", ")}` : "Steps taken"}
             </summary>
             <div className="space-y-1 px-3.5 pb-3">
               {(m.steps ?? []).filter((s) => s.label).map((s, j) => (

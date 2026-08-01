@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Segmented, Avatar, EmptyState, LiveDot } from "@/components/ui/primitives";
 import { Alert, Stock } from "@/lib/data";
 import { DataHealthCard } from "@/components/widgets/data-health";
+import { NewsAlerts } from "@/components/widgets/news-alerts";
 import { useApi } from "@/lib/use-api";
 import { POLL } from "@/lib/poll";
 import { timeAgo, timeUntil } from "@/lib/format";
@@ -117,9 +118,10 @@ export default function Alerts() {
   return (
     <div>
       <PageHeader eyebrow="Monitor" title="Alerts"
-        description="Price, volume, technical, AI-rating and news triggers — saved and monitored."
+        description="Live news alerts that need attention, plus your saved price, volume, technical and AI-rating triggers."
         actions={<>{live && <LiveDot />}<Button variant="primary" size="sm" onClick={() => setOpen((v) => !v)}><Plus size={14} />New Alert</Button></>} />
 
+      <NewsAlerts />
       <DataHealthCard />
       <IngestionMonitor />
 
