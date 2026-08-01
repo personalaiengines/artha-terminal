@@ -55,11 +55,31 @@ def test_portfolio_and_market_feed_are_judged_separately(monkeypatch):
     assert issue["source"] == "upstox_portfolio"
     assert "Market data is unaffected" in issue["detail"]
 
+    # The market-data token has to be stubbed too, or this asserts nothing on a
+    # machine without one: _check_market_feed() reports the missing token before
+    # it ever looks at the stream. That is why this passed locally (a real .env)
+    # and failed in CI (no .env) — the test read as green while never reaching
+    # the branch it was written to pin.
+    from config import config
+    monkeypatch.setattr(config.upstox, "analytics_token", "test-analytics-token")
+
     from services.upstox_stream import get_stream_manager
     monkeypatch.setattr(get_stream_manager(), "status",
                         lambda: {"started": True, "connected": True,
                                  "last_tick_age_s": 1.0, "subscribed": 5})
     assert dh._check_market_feed() is None
+
+
+def test_a_missing_market_data_token_is_reported_on_its_own(monkeypatch):
+    """The other half of the split above, and the state CI actually runs in."""
+    from config import config
+    monkeypatch.setattr(config.upstox, "analytics_token", None)
+
+    issue = dh._check_market_feed()
+    assert issue["source"] == "upstox_feed"
+    assert issue["severity"] == "error"
+    # Says what is served instead, rather than just declaring the feed down.
+    assert "Yahoo" in issue["detail"]
 
 
 class _FakeConn:
