@@ -1,5 +1,5 @@
 ---
-title: ARTHA Terminal — self-hosted Indian stock market dashboard
+title: Self-hosted Indian stock market dashboard
 description: >-
   Live NSE and BSE market data through the Upstox API, an F&O option chain and
   level engine, portfolio tracking, and an AI analyst grounded in your own
