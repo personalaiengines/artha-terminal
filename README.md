@@ -1,8 +1,14 @@
 # ARTHA Terminal
 
-**A self-hosted research terminal for Indian equities and derivatives.** Live
-NSE/BSE market data, an option-chain and F&O level engine, and an AI analyst that
-is grounded in your own database rather than in the model's memory.
+**A self-hosted dashboard for the Indian stock market.** Live NSE and BSE data
+through the Upstox API, an F&O option chain and level engine, portfolio
+tracking, and an AI analyst grounded in your own database rather than in the
+model's memory.
+
+[![CI](https://github.com/personalaiengines/artha-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/personalaiengines/artha-terminal/actions/workflows/ci.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
+![Next.js 15](https://img.shields.io/badge/next.js-15-black)
+![License MIT](https://img.shields.io/badge/license-MIT-green)
 
 Read-only by design — order APIs are never wired — and built so every number on
 screen can be traced to where it came from.
