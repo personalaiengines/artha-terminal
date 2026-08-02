@@ -1,0 +1,27 @@
+# GitHub Pages configuration for the ARTHA Terminal docs site.
+#
+# Source: master branch, /docs folder. GitHub builds this with Jekyll; the theme
+# and the seo plugin are both on the Pages allow-list, so nothing needs to be
+# vendored or built locally.
+#
+# `title` and `description` are what jekyll-seo-tag writes into <title> and the
+# meta description — i.e. what a search engine shows. They deliberately repeat
+# the terms someone would actually type: Upstox, NSE, dashboard, option chain.
+
+title: ARTHA Terminal
+description: >-
+  Self-hosted Indian stock market dashboard. Live NSE and BSE data through the
+  Upstox API, an F&O option chain and level engine, portfolio tracking, and a
+  database-grounded AI analyst. Next.js and Python, runs in Docker.
+
+url: https://personalaiengines.github.io
+baseurl: /artha-terminal
+
+theme: jekyll-theme-cayman
+plugins:
+  - jekyll-seo-tag
+
+# The repo link in the theme header.
+github:
+  repository_url: https://github.com/personalaiengines/artha-terminal
+show_downloads: false

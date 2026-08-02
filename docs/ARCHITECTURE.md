@@ -1,6 +1,6 @@
 # ARTHA Terminal — Architecture
 
-The long-form reference. [The README](../README.md) covers what you need and how
+The long-form reference. [The README](https://github.com/personalaiengines/artha-terminal#readme) covers what you need and how
 to run it; this covers how it works and why it is built this way.
 
 Contents: the two-database trap · full configuration · project structure · the
@@ -181,7 +181,7 @@ index names both resolve server-side — clients never handle Upstox's
 pipe-delimited ISIN keys.
 
 Responses are cached with stale-while-revalidate; TTLs are mirrored client-side
-in [`web/lib/poll.ts`](../web/lib/poll.ts) so polling never outpaces the cache.
+in [`web/lib/poll.ts`](https://github.com/personalaiengines/artha-terminal/blob/master/web/lib/poll.ts) so polling never outpaces the cache.
 
 ---
 
@@ -561,7 +561,7 @@ MIT
 Two independent paths to see support/resistance, max-pain, OI-wall and pivot
 levels on a live chart.
 
-**Path 1 — in the app (default).** [`web/components/widgets/kline-chart.tsx`](../web/components/widgets/kline-chart.tsx),
+**Path 1 — in the app (default).** [`web/components/widgets/kline-chart.tsx`](https://github.com/personalaiengines/artha-terminal/blob/master/web/components/widgets/kline-chart.tsx),
 built on [KLineChart](https://klinecharts.com) (Apache-2.0), documented in full
 under **The F&O chart** below. Levels, drawing tools, indicators and live ticks
 in the page itself — no external app, no licence to apply for.
