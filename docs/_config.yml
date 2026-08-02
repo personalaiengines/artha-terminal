@@ -17,6 +17,13 @@ description: >-
 url: https://personalaiengines.github.io
 baseurl: /artha-terminal
 
+# Card image for links shared to Twitter/LinkedIn/Slack. Same 1280x640 file the
+# repo uses as its social preview; assets/social-preview.html is the source it
+# was rendered from, so it can be edited and re-shot rather than redrawn.
+image: /artha-terminal/assets/social-preview.png
+twitter:
+  card: summary_large_image
+
 theme: jekyll-theme-cayman
 plugins:
   - jekyll-seo-tag

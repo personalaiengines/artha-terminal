@@ -1,0 +1,76 @@
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1280px; height: 640px; overflow: hidden;
+    background: #0b0d12;
+    font-family: "Segoe UI", Inter, system-ui, sans-serif;
+    color: #eef1f6;
+    position: relative;
+  }
+  /* faint grid, like the chart pane */
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(35,39,47,.55) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(35,39,47,.55) 1px, transparent 1px);
+    background-size: 64px 64px;
+  }
+  .glow {
+    position: absolute; width: 900px; height: 900px; right: -260px; top: -380px;
+    background: radial-gradient(circle, rgba(59,130,246,.18) 0%, transparent 62%);
+  }
+  .wrap { position: relative; padding: 72px 80px; height: 100%; display: flex; flex-direction: column; }
+  .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 34px; }
+  .mark {
+    width: 44px; height: 44px; border-radius: 11px;
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; font-weight: 700; color: #0b0d12;
+  }
+  .brandname { font-size: 21px; font-weight: 650; letter-spacing: .16em; text-transform: uppercase; }
+  .brandsub { font-size: 12.5px; letter-spacing: .3em; text-transform: uppercase; color: #7b8394; margin-top: 3px; }
+  h1 { font-size: 62px; line-height: 1.07; font-weight: 700; letter-spacing: -.022em; max-width: 940px; }
+  h1 .accent { color: #3b82f6; }
+  p.sub { margin-top: 24px; font-size: 25px; line-height: 1.45; color: #b6bdcc; max-width: 900px; }
+  .tags { margin-top: auto; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .tag {
+    font-size: 17px; padding: 9px 17px; border-radius: 999px;
+    background: #1c2029; border: 1px solid #23272f; color: #b6bdcc;
+  }
+  .tag.up { color: #10b981; border-color: rgba(16,185,129,.35); }
+  .spark { position: absolute; right: 80px; bottom: 132px; opacity: .95; }
+</style>
+
+<div class="grid"></div>
+<div class="glow"></div>
+
+<svg class="spark" width="330" height="132" viewBox="0 0 330 132" fill="none">
+  <polyline points="0,104 30,88 60,96 90,62 120,72 150,40 180,52 210,30 240,44 270,20 300,28 330,8"
+            stroke="#10b981" stroke-width="3.5" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+  <line x1="0" y1="74" x2="330" y2="74" stroke="#f4586a" stroke-width="1.5" stroke-dasharray="7 6" opacity=".65"/>
+  <line x1="0" y1="46" x2="330" y2="46" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="7 6" opacity=".65"/>
+</svg>
+
+<div class="wrap">
+  <div class="brand">
+    <div class="mark">A</div>
+    <div>
+      <div class="brandname">ARTHA Terminal</div>
+      <div class="brandsub">Open source · MIT</div>
+    </div>
+  </div>
+
+  <h1>Self-hosted <span class="accent">Indian stock market</span> dashboard</h1>
+  <p class="sub">
+    Live NSE &amp; BSE data via the Upstox API · F&amp;O option chain and level
+    engine · portfolio tracking · an AI analyst grounded in your own database
+  </p>
+
+  <div class="tags">
+    <span class="tag up">● Live ticks</span>
+    <span class="tag">Upstox API</span>
+    <span class="tag">Option chain</span>
+    <span class="tag">Next.js + Python</span>
+    <span class="tag">Runs in Docker</span>
+  </div>
+</div>
