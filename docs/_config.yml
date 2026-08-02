@@ -25,8 +25,12 @@ twitter:
   card: summary_large_image
 
 theme: jekyll-theme-cayman
+# jekyll-sitemap writes /sitemap.xml at build. It is the URL you hand to Google
+# Search Console and Bing Webmaster Tools so the crawler is told about every
+# page at once instead of finding them by following links that do not exist yet.
 plugins:
   - jekyll-seo-tag
+  - jekyll-sitemap
 
 # The repo link in the theme header.
 github:
