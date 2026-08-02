@@ -17,12 +17,23 @@ description: >-
 url: https://personalaiengines.github.io
 baseurl: /artha-terminal
 
-# Card image for links shared to Twitter/LinkedIn/Slack. Same 1280x640 file the
-# repo uses as its social preview; assets/social-preview.html is the source it
+# Card image for links shared to LinkedIn/Twitter/Slack. Same 1280x640 file the
+# repo uses as its social preview; assets/_social-preview.html is the source it
 # was rendered from, so it can be edited and re-shot rather than redrawn.
-image: /artha-terminal/assets/social-preview.png
-twitter:
-  card: summary_large_image
+#
+# This has to be a front matter default, not a top-level `image:` key —
+# jekyll-seo-tag reads `page.image` and ignores `site.image`, so the top-level
+# form emitted no og:image at all. The path is site-root-relative because
+# seo-tag runs it through `absolute_url`, which prepends the baseurl itself;
+# writing /artha-terminal/... here would double the prefix.
+#
+# twitter:card is left unset deliberately: seo-tag picks summary_large_image on
+# its own once an image exists, and naming a `twitter:` block without a
+# username made it emit a bare `<meta name="twitter:site" content="@">`.
+defaults:
+  - scope: { path: "" }
+    values:
+      image: /assets/social-preview.png
 
 theme: jekyll-theme-cayman
 # jekyll-sitemap writes /sitemap.xml at build. It is the URL you hand to Google
