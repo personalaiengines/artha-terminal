@@ -1,34 +1,43 @@
 "use client";
-import { animate, motion, useInView } from "framer-motion";
-import { useEffect, useRef, useState } from "react";
+import { motion, useInView } from "framer-motion";
+import { useRef } from "react";
 import { ArrowUpRight, ArrowDownRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUI } from "@/components/layout/ui-store";
 
-// Count-up number. Used for every headline metric so animation is uniform.
+// Headline metric number. Renders the value, and nothing else.
+//
+// This used to count up from 0 over 0.9s via framer-motion, gated on
+// `useInView(ref, { once: true })`. That decoration cost three separate money
+// bugs and is gone:
+//
+//   * the ref was attached only on the non-null branch, so while data loaded the
+//     IntersectionObserver had no node; with `once: true` it never re-subscribed
+//     and the count-up never started, leaving the initial `useState(0)` on screen;
+//   * `display ?? safe` only guards null — the animation's first frame sets 0,
+//     and `0 ?? safe` is 0, so an interrupted animation stuck at zero;
+//   * even working perfectly, it displays numbers that are simply false for up
+//     to a second, and any throttling (background tab, slow device, a re-render
+//     mid-flight) leaves one of them on screen.
+//
+// A ₹1,842 Value at Risk rendered as ₹0 next to its own correct sub-label. On a
+// screen whose entire purpose is telling someone what they stand to lose, a
+// number that animates is worth less than a number that is right.
+//
+// The name and props are unchanged so no caller had to move.
 export function AnimatedNumber({
   value, decimals = 2, prefix = "", suffix = "", className,
 }: { value: number | null | undefined; decimals?: number; prefix?: string; suffix?: string; className?: string }) {
-  const ref = useRef<HTMLSpanElement>(null);
-  const inView = useInView(ref, { once: true, margin: "-40px" });
-  const [display, setDisplay] = useState(0);
   const safe = typeof value === "number" && Number.isFinite(value) ? value : null;
-
-  useEffect(() => {
-    if (!inView || safe === null) return;
-    const controls = animate(0, safe, {
-      duration: 0.9, ease: [0.22, 1, 0.36, 1],
-      onUpdate: (v) => setDisplay(v),
-    });
-    return () => controls.stop();
-  }, [inView, safe]);
-
-  if (safe === null) return <span className={cn("tnum", className)}>—</span>;
   return (
-    <span ref={ref} className={cn("tnum", className)}>
-      {prefix}
-      {display.toLocaleString("en-IN", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}
-      {suffix}
+    <span className={cn("tnum", className)}>
+      {safe === null ? "—" : (
+        <>
+          {prefix}
+          {safe.toLocaleString("en-IN", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}
+          {suffix}
+        </>
+      )}
     </span>
   );
 }
@@ -74,17 +83,30 @@ export function Stat({
 }
 
 // Circular 0-10 / 0-100 score ring, colored by band.
+//
+// `tone="risk"` inverts the band. The default reads high-is-good, which is right
+// for a health score and exactly backwards for a risk score — an 8.7/10 risk
+// book was rendering a green ring next to the word "Elevated".
 export function ScoreRing({
   value, max = 10, size = 68, label, tone,
-}: { value: number | null | undefined; max?: number; size?: number; label?: string; tone?: "ai" | "auto" }) {
+}: {
+  value: number | null | undefined; max?: number; size?: number; label?: string;
+  tone?: "ai" | "auto" | "risk";
+}) {
   const ref = useRef<SVGSVGElement>(null);
   const inView = useInView(ref, { once: true });
-  const safe = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const known = typeof value === "number" && Number.isFinite(value);
+  const safe = known ? (value as number) : 0;
   const pct = Math.min(1, safe / max);
   const r = (size - 8) / 2;
   const c = 2 * Math.PI * r;
-  const color = tone === "ai" ? "var(--color-ai)"
-    : pct >= 0.75 ? "var(--color-up)" : pct >= 0.5 ? "var(--color-warn)" : "var(--color-down)";
+  // An unknown score is not a zero one: draw the track only, and print an em
+  // dash, rather than a confident "0.0" in whichever colour zero happens to hit.
+  const color = !known ? "var(--color-line)"
+    : tone === "ai" ? "var(--color-ai)"
+      : tone === "risk"
+        ? (pct >= 0.7 ? "var(--color-down)" : pct >= 0.4 ? "var(--color-warn)" : "var(--color-up)")
+        : pct >= 0.75 ? "var(--color-up)" : pct >= 0.5 ? "var(--color-warn)" : "var(--color-down)";
   return (
     <div className="relative inline-flex items-center justify-center" style={{ width: size, height: size }}>
       <svg ref={ref} width={size} height={size} className="-rotate-90">
@@ -93,12 +115,12 @@ export function ScoreRing({
           cx={size / 2} cy={size / 2} r={r} fill="none" stroke={color} strokeWidth={4}
           strokeLinecap="round" strokeDasharray={c}
           initial={{ strokeDashoffset: c }}
-          animate={inView ? { strokeDashoffset: c * (1 - pct) } : {}}
+          animate={inView ? { strokeDashoffset: c * (1 - (known ? pct : 0)) } : {}}
           transition={{ duration: 1, ease: [0.22, 1, 0.36, 1] }}
         />
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className="text-[15px] font-bold text-frost tnum leading-none">{safe.toFixed(1)}</span>
+        <span className="text-[15px] font-bold text-frost tnum leading-none">{known ? safe.toFixed(1) : "—"}</span>
         {label && <span className="text-[8.5px] text-muted uppercase mt-0.5 tracking-wider">{label}</span>}
       </div>
     </div>

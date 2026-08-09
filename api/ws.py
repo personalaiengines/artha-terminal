@@ -54,14 +54,21 @@ class ConnectionManager:
         self.clients: dict[WebSocket, set[str]] = {}
         self._queues: dict[WebSocket, asyncio.Queue] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Upstox instrument key -> the name the client subscribed with.
+        # Upstox instrument key -> every name any client subscribed it under.
         #
         # Equities resolve to their ISIN key (`NSE_EQ|INE002A01018`), so a tick
         # broadcast under that key never matched a browser handler registered
         # under "RELIANCE" — every equity tick was silently dropped and stock
         # prices only ever moved on the REST poll. Ticks now carry the caller's
         # own name alongside the key.
-        self._names: dict[str, str] = {}
+        #
+        # A SET of names, not one: two callers can reach the same instrument by
+        # different aliases ("nifty50" from the topbar ticker, "NIFTY50" from a
+        # hook that upper-cases its input), and both resolve to
+        # `NSE_INDEX|Nifty 50`. Storing one name meant the last subscriber to
+        # arrive silently un-ticked the first — the page kept its socket, kept
+        # its subscription, and simply never received a tick it could match.
+        self._names: dict[str, set[str]] = {}
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -96,7 +103,7 @@ class ConnectionManager:
         for name in keys[:room]:
             key = _resolve_key(name)
             resolved.append(key)
-            self._names[key] = name
+            self._names.setdefault(key, set()).add(name)
         self.clients[ws].update(resolved)
         from services.upstox_stream import get_stream_manager
         get_stream_manager().subscribe(resolved)
@@ -116,9 +123,11 @@ class ConnectionManager:
         event loop via call_soon_threadsafe, never touch the queues directly."""
         if self._loop is None:
             return
+        names = sorted(self._names.get(instrument_key) or {instrument_key})
+        # `symbol` stays a single string for any client still reading it;
+        # `symbols` carries every alias so none of them goes unmatched.
         payload = {"type": "tick", "key": instrument_key,
-                   "symbol": self._names.get(instrument_key, instrument_key),
-                   "tick": tick}
+                   "symbol": names[0], "symbols": names, "tick": tick}
         for ws, keys in list(self.clients.items()):
             if instrument_key in keys:
                 q = self._queues.get(ws)

@@ -23,6 +23,7 @@ def _fresh_app():
     # Reset shared state between tests — `manager` is a module-level singleton.
     manager.clients.clear()
     manager._queues.clear()
+    manager._names.clear()
     manager._loop = None
     return Starlette(routes=[WebSocketRoute("/ws", ws_endpoint)])
 
@@ -41,7 +42,32 @@ def test_subscribe_then_broadcast_tick_reaches_client():
         msg = ws.receive_json()
 
     assert msg == {"type": "tick", "key": "NSE_INDEX|Nifty 50",
-                   "symbol": "NSE_INDEX|Nifty 50", "tick": {"ltp": 24000.0}}
+                   "symbol": "NSE_INDEX|Nifty 50",
+                   "symbols": ["NSE_INDEX|Nifty 50"], "tick": {"ltp": 24000.0}}
+
+
+def test_two_aliases_for_one_instrument_both_get_the_tick():
+    """The topbar ticker subscribes "nifty50"; a hook that upper-cases its input
+    subscribes "NIFTY50". Both resolve to `NSE_INDEX|Nifty 50`, and the tick used
+    to echo only the name that arrived last — so whichever component mounted
+    first silently stopped receiving ticks while its socket and its subscription
+    both stayed perfectly healthy. That is how the F&O page's spot price sat
+    frozen on a cached chain value with a live index ticker directly above it.
+    """
+    app = _fresh_app()
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.send_json({"action": "subscribe", "keys": ["nifty50"]})
+        ws.send_json({"action": "subscribe", "keys": ["NIFTY50"]})
+
+        import time
+        time.sleep(0.1)
+
+        manager.broadcast_tick("NSE_INDEX|Nifty 50", {"ltp": 24000.0})
+        msg = ws.receive_json()
+
+    assert sorted(msg["symbols"]) == ["NIFTY50", "nifty50"]
+    # Still one string for anything reading the old field.
+    assert msg["symbol"] in msg["symbols"]
 
 
 def test_equity_tick_carries_the_name_the_client_subscribed_with():

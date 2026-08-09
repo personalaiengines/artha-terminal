@@ -34,9 +34,17 @@ const PUBLISHERS: Record<string, string> = {
   reuters: "Reuters", bloomberg: "Bloomberg", cnbctv18: "CNBC-TV18",
   ndtvprofit: "NDTV Profit", zeebiz: "Zee Business", financialexpress: "Financial Express",
 };
+// Hosts whose first label is not the publisher's name. Finnhub hands back
+// news.google.com redirect URLs, and taking the stem bylined those cards
+// "News" — a masthead that does not exist.
+const HOSTS: Record<string, string> = {
+  "news.google.com": "Google News",
+};
+
 function publisher(url: string): string {
   try {
     const host = new URL(url).hostname.replace(/^www\./, "");
+    if (HOSTS[host]) return HOSTS[host];
     const stem = host.split(".")[0];
     return PUBLISHERS[stem] ?? stem.charAt(0).toUpperCase() + stem.slice(1);
   } catch {
@@ -85,10 +93,16 @@ export async function GET() {
       source: url ? publisher(url) : (n.source ?? "Newswire"),
       url,
       sentiment: sentiment(text),
-      // Curation timestamp, not a per-article publish time — the search
-      // backends don't return one, and the old `now - i*30min` ladder was a
-      // fabricated "2h ago" on every card.
-      time: live.generated_ist ?? new Date().toISOString(),
+      // The article's own publication time, straight from the backend's
+      // `published` (RSS <pubDate> / Finnhub `datetime`, ISO-8601 UTC).
+      //
+      // This used to be the *curation* timestamp, so every card read "just now"
+      // however old the story was — a nine-year-old article and one filed ten
+      // minutes ago were captioned identically. Empty string when the item is
+      // genuinely undated: the UI then shows no time at all, which is honest,
+      // where falling back to the curation clock would re-invent the very
+      // freshness this replaced.
+      time: n.published ?? "",
       summary: n.snippet ?? n.summary ?? "",
       tickers: Array.isArray(n.tickers) ? n.tickers.slice(0, 4) : [],
       // Prefer the derived category — Earnings/Sector/Flows/Corporate are

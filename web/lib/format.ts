@@ -83,8 +83,16 @@ export function trendClass(n: Num) {
   return n > 0 ? "text-up" : n < 0 ? "text-down" : "text-muted";
 }
 
-export function timeAgo(iso: string) {
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+// Null-safe like every other formatter here. News items can genuinely have no
+// publication time — a search hit carries none — and an undated item must
+// render as nothing rather than "NaN d ago", which is what an empty string put
+// through the old arithmetic produced.
+export function timeAgo(iso: string | null | undefined) {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const diff = (Date.now() - t) / 1000;
+  if (diff < 0) return "just now";
   if (diff < 60) return "just now";
   if (diff < 3600) return Math.floor(diff / 60) + "m ago";
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";

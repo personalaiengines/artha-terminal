@@ -51,8 +51,16 @@ logs-web:
 shell:
 	docker compose exec api sh
 
+# `exec api pytest tests/` cannot work: the production image deliberately omits
+# tests/ (Dockerfile copies only config/db/ingestion/engines/agent/services/api/
+# scripts). So mount the suite read-only into a throwaway container instead.
+# MSYS_NO_PATHCONV + `pwd -W` keep Git Bash on Windows from mangling both sides
+# of the -v argument; both are harmless on Linux and macOS.
+# test_news_degraded still fails here — it reads web/, which is not in this image.
 test:
-	docker compose exec api pytest tests/ -q
+	MSYS_NO_PATHCONV=1 docker compose run --rm --no-deps \
+		-v "$$(pwd -W 2>/dev/null || pwd)/tests:/app/tests:ro" \
+		--entrypoint pytest api tests/ -q
 
 init-db:
 	docker compose exec api python -c "from db import init_database; print(init_database())"

@@ -211,7 +211,11 @@ export default function News() {
                     n.sentiment === "positive" ? "bg-up" : n.sentiment === "negative" ? "bg-down" : "bg-muted")} />
                   <div>
                     <p className="line-clamp-2 text-[12px] font-medium leading-snug text-frost group-hover:text-accent">{n.headline}</p>
-                    <p className="mt-0.5 text-[10.5px] text-muted">{n.source} · {timeAgo(n.time)}</p>
+                    {/* Undated items exist (a search hit carries no publication
+                        time), so the separator has to go with the timestamp. */}
+                    <p className="mt-0.5 text-[10.5px] text-muted">
+                      {[n.source, timeAgo(n.time)].filter(Boolean).join(" · ")}
+                    </p>
                   </div>
                 </a>
               ))}

@@ -39,8 +39,8 @@ g.window = { localStorage: {
   setItem: (k: string, v: string) => { store.set(k, v); },
   removeItem: (k: string) => { store.delete(k); },
 } };
-writeJson(prefsKey(), { type: "area", hidden: ["Pivot R2"] });
-ok(readJson<{ type: string }>(prefsKey(), { type: "candles" }).type === "area", "prefs round-trip");
+writeJson(prefsKey("fno"), { type: "area", hidden: ["Pivot R2"] });
+ok(readJson<{ type: string }>(prefsKey("fno"), { type: "candles" }).type === "area", "prefs round-trip");
 store.set(drawKey("NIFTY"), "{ not json");
 ok(readJson(drawKey("NIFTY"), []).length === 0, "corrupt JSON falls back instead of throwing");
 store.set(drawKey("NIFTY"), "null");
@@ -48,7 +48,7 @@ ok(readJson(drawKey("NIFTY"), []).length === 0, "a stored null falls back");
 ok(readJson(drawKey("BANKNIFTY"), []).length === 0, "a missing key falls back");
 // A throwing localStorage (private mode, quota) must not take the chart down.
 g.window.localStorage.setItem = () => { throw new Error("QuotaExceededError"); };
-writeJson(prefsKey(), { type: "bars" });
-ok(readJson<{ type: string }>(prefsKey(), { type: "x" }).type === "area", "a failed write leaves the old value, and does not throw");
+writeJson(prefsKey("fno"), { type: "bars" });
+ok(readJson<{ type: string }>(prefsKey("fno"), { type: "x" }).type === "area", "a failed write leaves the old value, and does not throw");
 
 console.log("chart-store OK");

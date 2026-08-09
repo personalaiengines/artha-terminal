@@ -75,7 +75,7 @@ def test_international_coverage_is_guaranteed():
     assert res["count"] == 10, "the floor must not grow the feed past its limit"
     # Tracks the constant rather than restating it — the floor is also the
     # target the curation prompt is given, so the two move together.
-    assert sum(1 for i in res["items"] if i["region"] == "global") == mn._MIN_GLOBAL
+    assert sum(1 for i in res["items"] if i["region"] == "global") == mn._min_global(10)
     assert len({i["link"] for i in res["items"]}) == 10
 
 
@@ -95,8 +95,8 @@ def test_total_curation_failure_still_leads_with_indian_news():
         res = get_live_market_news(limit=14)
 
     counts = collections.Counter(i["region"] for i in res["items"])
-    assert counts["global"] == mn._MIN_GLOBAL, "exactly the shortfall, no more"
-    assert counts["india"] == 14 - mn._MIN_GLOBAL
+    assert counts["global"] == mn._min_global(14), "exactly the shortfall, no more"
+    assert counts["india"] == 14 - mn._min_global(14)
     assert len({i["link"] for i in res["items"]}) == 14
 
 
@@ -119,15 +119,62 @@ def test_social_links_never_become_news_sources():
     with patch.object(mn, "_search", side_effect=lambda q, limit=6: [
             {"title": "Dow tumbles", "link": "https://www.instagram.com/p/abc", "snippet": ""},
             {"title": "Fed holds", "link": "https://youtube.com/watch?v=1", "snippet": ""},
-            {"title": "Nifty ends higher", "link": "https://www.moneycontrol.com/n/1", "snippet": ""},
+            {"title": "Nifty ends higher", "snippet": "",
+             "link": "https://www.moneycontrol.com/news/business/markets/nifty-ends-higher-12345678.html"},
          ] if q == mn._QUERIES[0][0] else []), \
+         patch("services.india_news.get_india_market_news", return_value=[]), \
          patch("services.finnhub_news.get_finnhub_general_news", return_value=[]):
         links = [r["link"] for r in mn._gather()]
-    assert links == ["https://www.moneycontrol.com/n/1"]
+    assert links == ["https://www.moneycontrol.com/news/business/markets/nifty-ends-higher-12345678.html"]
     # Subdomains of a blocked host are blocked; a lookalike host is not.
     assert mn._is_publisher("https://m.facebook.com/x") is False
     assert mn._is_publisher("https://notx.com/x") is True
     assert mn._is_publisher("") is False
+
+
+def test_section_fronts_never_become_news_items():
+    """The other half of "is this a source": a real publisher's *landing page*
+    is not a story. These exact URLs were in a live feed, each with a headline
+    the curator had invented for it because the page itself says nothing."""
+    for url in ("https://www.moneycontrol.com/stocksmarketsindia/",
+                "https://www.thehindu.com/business/markets/",
+                "https://www.hdfcsec.com/market/equity",
+                "https://www.nseindia.com/",
+                "https://finance.yahoo.com/quote/%5ENSEI/",
+                "https://groww.in/indices/nifty"):
+        assert mn._is_article(url) is False, url
+
+    for url in ("https://www.cnbc.com/2026/08/04/oil-rises-after-selloff-as-talks-advance.html",
+                "https://economictimes.indiatimes.com/markets/stocks/news/x/articleshow/12345678.cms",
+                "https://www.reuters.com/business/sp-500-nasdaq-futures-inch-up-before-fed/"):
+        assert mn._is_article(url) is True, url
+
+
+def test_stale_items_are_dropped_and_the_feed_is_newest_first():
+    """A dated item past the age ceiling never reaches the curator, and what
+    does arrives freshest-first. The 2017 CNBC article that shipped in a live
+    feed is the exact case: nothing knew how old it was."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(hours=1)).isoformat()
+    old = (now - timedelta(hours=2)).isoformat()
+
+    with patch.object(mn, "_search", side_effect=lambda q, limit=6: [
+            # Undated, but the date is in the URL — the only signal a search hit has.
+            {"title": "BOJ cuts inflation outlook", "snippet": "",
+             "link": "https://www.cnbc.com/amp/2017/07/19/asia-markets-bank-of-japan-ecb.html"},
+         ] if q == mn._QUERIES[0][0] else []), \
+         patch("services.india_news.get_india_market_news", return_value=[
+            {"title": "Older story", "link": "https://a.test/older-story-here-12345678",
+             "snippet": "", "published": old},
+            {"title": "Newer story", "link": "https://a.test/newer-story-here-87654321",
+             "snippet": "", "published": fresh},
+         ]), \
+         patch("services.finnhub_news.get_finnhub_general_news", return_value=[]):
+        rows = mn._gather()
+
+    assert [r["title"] for r in rows] == ["Newer story", "Older story"]
+    assert all("2017" not in r["link"] for r in rows), "a 2017 article must not survive"
 
 
 def _phase(state: str, note: str, hhmm: tuple[int, int]) -> str:
@@ -211,25 +258,47 @@ def test_curate_still_reads_a_bare_array_reply():
 
 def test_same_story_from_two_outlets_appears_once():
     """Real pair from a live cycle. Different URLs and different wording, so
-    neither the link dedup nor the exact-title dedup catches it."""
+    neither the link dedup nor the exact-title dedup catches it.
+
+    The near-duplicate wording now lives in the SOURCE titles, because the
+    curator no longer writes headlines — the publisher's own is used verbatim,
+    so that is what the dedup compares. (It also matches reality better: this
+    pair really was two outlets' own headlines for one story.)"""
     raw = [
-        {"title": "a", "link": "https://a.test/1", "snippet": "s", "region": "global"},
-        {"title": "b", "link": "https://b.test/1", "snippet": "s", "region": "global"},
-        {"title": "c", "link": "https://c.test/1", "snippet": "s", "region": "india"},
+        {"title": "S&P 500 slid 1.52% to end the day at 7,316.15",
+         "link": "https://a.test/1", "snippet": "s", "region": "global"},
+        {"title": "S&P 500 declined 1.52% to end the session at 7,316.15 points",
+         "link": "https://b.test/1", "snippet": "s", "region": "global"},
+        {"title": "Nifty holds above 24,350 as auto stocks lead",
+         "link": "https://c.test/1", "snippet": "s", "region": "india"},
     ]
+    reply = json.dumps({"items": [{"n": 1}, {"n": 2}, {"n": 3}]})
+    with patch("agent.llm_client.complete", return_value=reply):
+        items, _ = _curate(raw, 10, "open")
+    # `n` indexes the interleaved prompt list (india first), not `raw`: row 1 is
+    # the Nifty line, rows 2 and 3 are the S&P pair — the second is dropped.
+    assert [i["title"] for i in items] == [
+        "Nifty holds above 24,350 as auto stocks lead",
+        "S&P 500 slid 1.52% to end the day at 7,316.15",
+    ]
+
+
+def test_the_curator_cannot_invent_a_headline():
+    """The model used to supply `headline`, and against a page with nothing to
+    summarise it invented the specifics — "Sensex gains modestly while Nifty
+    declines in early trade" was composed for a section front. It now only
+    picks a row; the publisher's headline is what ships."""
+    raw = [{"title": "Stock Market Today: Sensex, Nifty, BSE, NSE Latest Updates",
+            "link": "https://x.test/1", "snippet": "s", "region": "india"}]
     reply = json.dumps({"items": [
-        {"n": 1, "headline": "S&P 500 slid 1.52% to end the day at 7,316.15"},
-        {"n": 2, "headline": "S&P 500 declined 1.52% to end the session at 7,316.15 points"},
-        {"n": 3, "headline": "Nifty holds above 24,350 as auto stocks lead"},
+        {"n": 1, "headline": "Sensex gains modestly while Nifty declines in early trade",
+         "why": "sets the tone"},
     ]})
     with patch("agent.llm_client.complete", return_value=reply):
         items, _ = _curate(raw, 10, "open")
-    # `n` indexes the interleaved prompt list, not `raw`, so assert on the
-    # headlines: the first S&P line survives, the reworded one is dropped.
-    assert [i["title"] for i in items] == [
-        "S&P 500 slid 1.52% to end the day at 7,316.15",
-        "Nifty holds above 24,350 as auto stocks lead",
-    ]
+    assert len(items) == 1
+    assert items[0]["title"] == "Stock Market Today: Sensex, Nifty, BSE, NSE Latest Updates"
+    assert "Sensex gains modestly" not in items[0]["title"]
 
 
 def test_distinct_stories_are_not_collapsed():
@@ -271,3 +340,52 @@ def test_briefing_survives_a_truncated_reply():
         '   {"n": 1, "headline": "RBI ho')
     assert brief is not None and brief["points"] == ["p1"]
     assert [i["link"] for i in items] == ["https://x.test/2"]
+
+
+# --- feed size and the caps above it --------------------------------------
+
+def test_default_limit_fits_under_every_ceiling_above_it():
+    """The feed size is coupled to two things that live in other files, and
+    both couplings are silent when broken.
+
+    `_PROMPT_HITS` is a hard cap on ranked items — the curator cannot rank a row
+    it was never shown — so a limit above it guarantees a permanently partly
+    unranked feed flagged `degraded`. And `web/app/api/news/route.ts` slices the
+    payload, so a limit above that slice fetches and curates items the UI throws
+    away.
+    """
+    import inspect
+    import re as _re
+    from pathlib import Path
+
+    import pytest
+
+    default = inspect.signature(get_live_market_news).parameters["limit"].default
+    assert default <= mn._PROMPT_HITS, (
+        f"limit {default} exceeds _PROMPT_HITS {mn._PROMPT_HITS}: the curator is "
+        "only ever shown that many rows, so the rest can never be ranked"
+    )
+
+    route = Path(__file__).parent.parent / "web" / "app" / "api" / "news" / "route.ts"
+    if not route.exists():
+        # The API image ships no web/ (Dockerfile copies only the Python tree), so
+        # in-container this half has nothing to read. The Python ceiling above is
+        # still asserted; only the UI-slice comparison is skipped.
+        pytest.skip("web/app/api/news/route.ts absent — not shipped in the API image")
+    m = _re.search(r"\.slice\(0,\s*(\d+)\)", route.read_text(encoding="utf-8"))
+    assert m, "could not find the UI slice in web/app/api/news/route.ts"
+    assert default <= int(m.group(1)), (
+        f"limit {default} exceeds the UI slice {m.group(1)} — those items are "
+        "curated and then discarded before render"
+    )
+
+
+def test_global_floor_tracks_the_feed_size():
+    """The floor was a fixed 4 justified as a *share* of a 14-item feed. Held
+    fixed while the feed grew it would quietly halve international coverage."""
+    assert mn._min_global(14) == 4, "the original 4-of-14 must be preserved"
+    assert mn._min_global(24) == 7
+    assert mn._min_global(1) >= 1, "never zero: the Global tab must not empty"
+    # Monotonic — a bigger feed never carries less international news.
+    counts = [mn._min_global(n) for n in range(1, 40)]
+    assert counts == sorted(counts)
