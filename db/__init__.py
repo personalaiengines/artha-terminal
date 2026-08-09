@@ -85,6 +85,50 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
 
+    # fno_pnl_daily: one row per trading day of F&O P&L. Upstox's positions API
+    # is intraday-only — it forgets yesterday — so a tracker across sessions has
+    # to keep its own record. Written on every positions read; the last write of
+    # a day is that day's close.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fno_pnl_daily (
+            date TEXT PRIMARY KEY,
+            realized REAL NOT NULL DEFAULT 0,
+            unrealized REAL NOT NULL DEFAULT 0,
+            net REAL NOT NULL DEFAULT 0,
+            open_count INTEGER NOT NULL DEFAULT 0,
+            closed_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # fno_pnl_daily.source: 'live' (read off the broker's position book, carries
+    # unrealised too) or 'trades' (reconstructed from trade history, booked-only).
+    # The backfill must never overwrite a live row with a booked-only one.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fno_pnl_daily)")}
+    if cols and "source" not in cols:
+        conn.execute("ALTER TABLE fno_pnl_daily ADD COLUMN source TEXT DEFAULT 'live'")
+        print("[OK] Migration: added fno_pnl_daily.source")
+
+    # fno_pnl_contract_daily: the same day, broken down by contract. Keeps the
+    # tracker's filters (index, CE/PE, winners/losers) meaningful across the
+    # whole window instead of only for whatever the broker still has open now.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fno_pnl_contract_daily (
+            date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            realized REAL NOT NULL DEFAULT 0,
+            unrealized REAL NOT NULL DEFAULT 0,
+            net REAL NOT NULL DEFAULT 0,
+            qty INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (date, symbol)
+        )
+        """
+    )
+
     # SQLite can't ALTER a CHECK constraint in place — rebuild the table (the
     # standard SQLite recipe: rename, recreate, copy, drop) only if the new
     # value isn't already accepted, so this is a no-op on every later startup.
@@ -164,18 +208,6 @@ def get_connection(db_path: Path = None):
         raise e
     finally:
         conn.close()
-
-
-def dict_fetchone(cursor) -> dict | None:
-    """Fetch one row as dictionary."""
-    row = cursor.fetchone()
-    return dict(row) if row else None
-
-
-def dict_fetchall(cursor) -> list[dict]:
-    """Fetch all rows as list of dictionaries."""
-    rows = cursor.fetchall()
-    return [dict(row) for row in rows]
 
 
 # Initialize database on import

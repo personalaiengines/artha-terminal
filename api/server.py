@@ -432,8 +432,9 @@ def _events() -> dict:
         if ai.get("ok"):
             _cache_put("events_ai", ai)
 
-    base["india"] = sorted(base["india"] + ai.get("india", []), key=lambda e: e["date"])
-    base["international"] = sorted(base["international"] + ai.get("international", []), key=lambda e: e["date"])
+    _key = lambda e: (e["date"], e.get("time_ist") or "")
+    base["india"] = sorted(base["india"] + ai.get("india", []), key=_key)
+    base["international"] = sorted(base["international"] + ai.get("international", []), key=_key)
     return base
 
 async def events(req):
@@ -1132,10 +1133,13 @@ def _positions() -> dict:
     """The user's live F&O positions — READ-ONLY.
 
     Reads the book and nothing else: no order is placed, modified or cancelled
-    here or anywhere this route reaches. Only the seven display fields below
-    leave the process; the raw row's ~29 keys (account-level values, day-wise
-    breakdowns, instrument tokens) are not forwarded and nothing here logs a
-    symbol, a size or a P&L.
+    here or anywhere this route reaches. Only the display fields below leave the
+    process — the raw row's ~29 keys (account-level values, day-wise breakdowns)
+    are not forwarded and nothing here logs a symbol, a size or a P&L. The two
+    non-display fields, `key` and `multiplier`, are properties of the CONTRACT
+    rather than of the account: the same pair is public for anyone holding that
+    instrument, and they exist so the browser can subscribe the row to the tick
+    stream (see web/components/widgets/positions-panel.tsx).
 
     An expired/missing token is ok:false + the auth status, so the UI prompts a
     re-authorize. An empty book is a real answer: ok:true with items: [].
@@ -1145,33 +1149,86 @@ def _positions() -> dict:
     res = asyncio.run(UpstoxClient().get_positions())
     if res.get("status") != "ok":
         return {"ok": False, "status": res.get("status"), "message": res.get("message"), "items": []}
-    items, closed = [], 0
+    items, done = [], []
     for p in res.get("data", []) or []:
         if (p.get("exchange") or "").upper() not in _FNO_EXCHANGES:
             continue
         qty = p.get("quantity") or 0
-        if not qty:
-            # Upstox keeps a row for every contract traded today, including the
-            # ones squared off — net quantity 0. Those are not open positions and
-            # must not render as one; counted, not listed.
-            closed += 1
-            continue
-        items.append({
+        row = {
             "symbol": p.get("trading_symbol") or p.get("tradingsymbol") or "",
+            # The Upstox instrument key ("NSE_FO|46617"). Public instrument
+            # identity, not account data — forwarded so the browser can put the
+            # contract on the tick stream instead of waiting out the poll. Every
+            # other field here is a REST snapshot up to 30s old; the book is the
+            # one table on the page where that is visible as a frozen LTP.
+            "key": p.get("instrument_token"),
+            # Contract size per unit of `qty`. 1 for every Indian F&O contract
+            # today (quantity already carries lots x lot size), but it is what
+            # a P&L delta must be multiplied by, so take it from the broker
+            # rather than assuming.
+            "multiplier": p.get("multiplier"),
             "qty": qty,
             # Upstox has no side field: the sign of the net quantity is it.
             "side": "LONG" if qty > 0 else "SHORT",
             "avg": p.get("average_price"),
             "ltp": p.get("last_price"),
             "pnl": p.get("pnl"),
+            "realized": p.get("realised"),
+            "unrealized": p.get("unrealised"),
             "product": p.get("product"),
             "exchange": p.get("exchange"),
-        })
-    return {"ok": True, "status": "ok", "items": items, "closed": closed}
+        }
+        if not qty:
+            # Upstox keeps a row for every contract traded today, including the
+            # ones squared off — net quantity 0. Those are not open positions and
+            # must not render as one. They were previously counted and thrown
+            # away, which discarded the day's *booked* P&L: the tracker needs
+            # exactly that, so they are returned separately instead.
+            done.append(row)
+            continue
+        items.append(row)
+
+    # Realised is booked on every row — a squared-off contract's whole P&L lives
+    # there — while unrealised only exists while something is still open.
+    from services.fno_pnl import snapshot
+    totals = snapshot(items + done)
+
+    return {"ok": True, "status": "ok", "items": items,
+            "closed": len(done), "closedItems": done, **totals}
 
 async def positions(req):
     """GET only — see the Route entry. There is no write path for this data."""
     return JSONResponse(await run(_cached_call, "positions", _positions, 30))
+
+
+async def fno_pnl(req):
+    """The recorded F&O P&L curve. Reads the local record only — it does not
+    call the broker, so it still answers with the history after the daily token
+    expires, which is exactly when a tracker is worth having."""
+    import re as _re
+    from services.fno_pnl import history
+    # ?from=/&to= are ISO dates. Anything else is ignored rather than passed to
+    # the query — these interpolate into a BETWEEN, so the shape is checked here.
+    def _date(name: str) -> str | None:
+        v = (req.query_params.get(name) or "").strip()
+        return v if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
+    lo, hi = _date("from"), _date("to")
+    return JSONResponse({"ok": True, **await run(
+        _cached_call_arg, f"fno_pnl_{lo}_{hi}", lambda a: history(*a), (lo, hi), 60)})
+
+
+async def fno_pnl_backfill(req):
+    """Rebuild the daily record from Upstox trade history.
+
+    POST because it writes. It reads the trade *record* and derives P&L from it
+    — there is no order path here, same as every other route in this file.
+    """
+    from services.fno_pnl import backfill
+    res = await run(backfill, 3)
+    # Every window's cached history is stale the moment this lands.
+    for key in [k for k in _cache if k.startswith("fno_pnl_")]:
+        _cache.pop(key, None)
+    return JSONResponse(res)
 
 
 # ======================================================================
@@ -1405,6 +1462,10 @@ routes = [
     Route("/api/indices", india_board),
     Route("/api/data-health", data_health),
     Route("/api/events", events),
+    # Before /api/fno/{index}: Starlette matches in order, and the wildcard
+    # would otherwise swallow "pnl" as an index name.
+    Route("/api/fno/pnl", fno_pnl, methods=["GET"]),
+    Route("/api/fno/pnl/backfill", fno_pnl_backfill, methods=["POST"]),
     Route("/api/fno/{index}", fno),
     Route("/api/fno/{index}/expiries", fno_expiries),
     Route("/api/fno/{index}/term", fno_term),

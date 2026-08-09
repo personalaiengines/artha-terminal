@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { LineChart, Activity, Gauge, ArrowUpRight } from "lucide-react";
 import { PageHeader } from "@/components/widgets/page-header";
@@ -9,10 +9,13 @@ import { Segmented, LiveDot, EmptyState } from "@/components/ui/primitives";
 import { Badge } from "@/components/ui/badge";
 import { TIMEFRAME_DAYS, type Timeframe } from "@/components/ui/candles";
 import { KlineChart } from "@/components/widgets/kline-chart";
-import { LevelLadder, KIND_COLOR, type Zone, type Structure } from "@/components/widgets/level-ladder";
+import { LevelLadder, KIND_COLOR } from "@/components/widgets/level-ladder";
 import { PositionsPanel, usePositions, strikeOf } from "@/components/widgets/positions-panel";
 import { FnoNarrative } from "@/components/widgets/fno-narrative";
+import { PnlTracker } from "@/components/widgets/pnl-tracker";
 import { useApi } from "@/lib/use-api";
+import type { Candle, Plan } from "@/lib/fno-types";
+import { useLivePrices } from "@/lib/use-live-prices";
 import { POLL } from "@/lib/poll";
 import { num, trendClass } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -25,27 +28,6 @@ const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"];
 // The service key each switcher value resolves to, so the page can tell the
 // payload it asked for from the one still on screen.
 const INDEX_KEY: Record<string, string> = { NIFTY: "nifty50", BANKNIFTY: "banknifty", SENSEX: "sensex" };
-
-type Candle = { t: string; open: number; high: number; low: number; close: number; volume: number };
-type Leg = { oi: number; oiChg: number; vol: number; iv: number; ltp: number; delta: number | null; buildup: string | null };
-type OCRow = { strike: number; call: Leg; put: Leg };
-type Quad = { legs: number; oi_change: number };
-type BuildupSummary = {
-  call: Record<string, Quad | undefined>;
-  put: Record<string, Quad | undefined>;
-  unclassified?: { call: number; put: number };
-  basis?: string | null;
-};
-type Plan = {
-  ok: boolean; index: string; name: string; spot: number; atm: number; pcr: number; maxPain: number; iv: number; vix: number | null;
-  vixPctile: number | null; vixWindow: number; vixAsOf: string | null;
-  callWall: number | null; putWall: number | null; biasLabel: string | null; biasScore: number | null;
-  expiry: string | null;
-  levels: { label: string; price: number; kind: string; crossed: boolean }[];
-  zones: Zone[]; structure: Structure | null;
-  buildupSummary: BuildupSummary | null; buildupBasis: string | null;
-  rows: OCRow[];
-};
 
 // The four standard OI build-up quadrants (price change x OI change). These
 // describe what the OI did — they are not instructions.
@@ -74,6 +56,27 @@ export default function FnO() {
   const live = useApi<Plan | null>(`/api/fno/${idx}`, null, (j) => (j.ok ? j : null), POLL.fno);
   const candles = useApi<Candle[]>(`/api/history?symbols=${idx}&days=${TIMEFRAME_DAYS[tf]}&ohlc=1`, [], (j) => j.candles ?? [], POLL.history);
   const book = usePositions();
+  // The chain is server-cached for 120s and polled at 120s, so its `spot` was
+  // up to four minutes behind the tape the dashboard renders live. Subscribe the
+  // underlying to the same tick stream the index board uses — this hook must sit
+  // above the early return below, like every other one on this page.
+  const spotTick = useLivePrices([INDEX_KEY[idx]]);
+
+  // One mapping, straight from the confluence engine — the chart and the ladder
+  // draw the same zones in the same colours, with `crossed` marking the broken
+  // ones and `basis` carried through verbatim into the chart tooltip (R4/R18).
+  //
+  // Memoised, and up here with every other hook rather than beside its use below
+  // the early return: the tick subscription above re-renders this page several
+  // times a second, and a fresh array identity is enough to make the chart tear
+  // down and rebuild all ~19 level overlays on every one of those renders (R21).
+  // The mapping itself is untouched.
+  const chartLevels = useMemo(() => (live?.zones ?? []).map((z) => ({
+    price: z.price, lo: z.lo, hi: z.hi,
+    label: z.label,
+    color: KIND_COLOR[z.kind] ?? "#f5a623",
+    kind: z.kind, crossed: z.crossed, strength: z.strength, basis: z.basis, state: z.state,
+  })), [live?.zones]);
 
   const header = (
     <PageHeader eyebrow="Derivatives" title="F&O · Market Structure"
@@ -94,21 +97,20 @@ export default function FnO() {
           description={live
             ? "Pulling the option chain and rebuilding the level map for this index."
             : "Upstox may be unauthenticated, outside market hours, or unreachable."} /></CardBody></Card>
+        {/* The tracker and the containment rate read ARTHA's own record, not
+            the broker, so they are still worth showing on exactly the days the
+            chain will not load. */}
+        <div className="mt-6"><PnlTracker book={book} /></div>
       </div>
     );
   }
 
-  const { spot, atm, rows, pcr, maxPain, zones, structure } = live;
-
-  // One mapping, straight from the confluence engine — the chart and the ladder
-  // draw the same zones in the same colours, with `crossed` marking the broken
-  // ones and `basis` carried through verbatim into the chart tooltip (R4/R18).
-  const chartLevels = zones.map((z) => ({
-    price: z.price, lo: z.lo, hi: z.hi,
-    label: z.members.map((m) => m.label).join(" + "),
-    color: KIND_COLOR[z.kind] ?? "#f5a623",
-    kind: z.kind, crossed: z.crossed, strength: z.strength, basis: z.basis, state: z.state,
-  }));
+  const { atm, rows, pcr, maxPain, zones, structure } = live;
+  // Ticks win over the cached chain when one has arrived. Only `spot` moves:
+  // ATM, PCR and max pain are computed from the whole chain and stay on their
+  // own refresh rather than being implied to be as fresh as the price.
+  const tick = spotTick[INDEX_KEY[idx].toUpperCase()];
+  const spot = tick?.price ?? live.spot;
 
   // Open contracts pinned onto the ladder at the strike parsed from their name.
   const markers = (book?.items ?? [])
@@ -158,12 +160,18 @@ export default function FnO() {
 
       {/* Metrics — index-level context only. Per-strike microstructure is on /options. */}
       <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-6">
-        <Card className="p-4"><Stat label="Spot" value={spot} decimals={2} sub={live.expiry ? `expiry ${live.expiry}` : undefined} /></Card>
+        {/* Say which of the two this number is. A live tick and a two-minute-old
+            chain snapshot look identical on screen, and only one of them is
+            worth acting on. */}
+        <Card className="p-4"><Stat label="Spot" value={spot} decimals={2}
+          sub={[tick ? "live tick" : "chain snapshot", live.expiry ? `expiry ${live.expiry}` : ""].filter(Boolean).join(" · ")} /></Card>
         <Card className="p-4"><Stat label="ATM Strike" value={atm} decimals={0} /></Card>
         <Card className="p-4"><Stat label="PCR (OI)" value={pcr} decimals={2} sub={live.biasLabel ?? undefined} /></Card>
         <Card className="p-4"><Stat label="Max Pain" value={maxPain} decimals={0} /></Card>
         <Card className="p-4 xl:col-span-2"><Stat label="India VIX" value={live.vix} decimals={2} sub={vixSub} /></Card>
       </div>
+
+      {/* The only success figure in the app with a denominator behind it. */}
 
       {/* Chart + ladder are the centre of the page. */}
       <Card className="mb-6">
@@ -249,6 +257,10 @@ export default function FnO() {
             </Link>
           </Card>
         </div>
+      </div>
+
+      <div className="mt-6">
+        <PnlTracker book={book} />
       </div>
 
       <div className="mt-6">

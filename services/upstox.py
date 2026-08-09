@@ -529,6 +529,43 @@ class UpstoxClient:
             })
         return sorted(out, key=lambda x: x.get("date") or "")
 
+    async def get_historical_trades(
+        self, start_date: str, end_date: str, segment: str = "FO", page_size: int = 200
+    ) -> dict:
+        """Executed trades between two dates (access token), all pages.
+
+        Upstox rejects a range that crosses an Indian financial year
+        (UDAPI1093), so callers must chunk by FY — services.fno_pnl does. Read
+        only: this is the trade *record*, and nothing here can place an order.
+        """
+        if not self.access_token:
+            return {"status": "missing", "message": "UPSTOX_ACCESS_TOKEN not set"}
+        url = f"{self.BASE_URL}/charges/historical-trades"
+        out, page = [], 1
+        try:
+            async with httpx.AsyncClient() as client:
+                while True:
+                    r = await client.get(
+                        url, headers=self._get_headers(token_type="standard"), timeout=30.0,
+                        params={"start_date": start_date, "end_date": end_date,
+                                "segment": segment, "page_number": page, "page_size": page_size},
+                    )
+                    if r.status_code == 401:
+                        return {"status": "expired", "message": "Access token expired."}
+                    if r.status_code != 200:
+                        # A range with no trades at all answers 400 on some
+                        # accounts; treat it as "nothing here", not a failure,
+                        # or one empty year aborts the whole backfill.
+                        return {"status": "ok", "data": out} if out else {
+                            "status": "error", "message": f"HTTP {r.status_code}"}
+                    batch = r.json().get("data") or []
+                    out.extend(batch)
+                    if len(batch) < page_size:
+                        return {"status": "ok", "data": out}
+                    page += 1
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     async def get_positions(self) -> dict:
         """Live intraday positions (access token)."""
         if not self.access_token:
@@ -550,53 +587,3 @@ class UpstoxClient:
             return {"status": "error", "message": str(e)}
 
 
-async def get_quote_with_fallback(instrument_key: str, max_staleness_seconds: float = 5.0) -> dict:
-    """
-    Live quote for one instrument: prefer the WebSocket tick cache
-    (services.upstox_stream) when fresh, fall back to REST otherwise.
-
-    On the REST fallback path only, cross-checks Upstox against Yahoo Finance
-    via engines.verification.VerificationMembrane (its first live caller) and
-    tags the result with "verified_status" (VERIFIED/SINGLE_SOURCE/CONFLICT/
-    None). Existing callers of get_quote()/get_quote_by_keys() are unaffected
-    — this is an additive, optional-key path, not a breaking change.
-    """
-    import time
-    from services.upstox_stream import get_stream_manager
-
-    tick = get_stream_manager().get_cached_tick(instrument_key)
-    if tick and tick.get("ltp") is not None and (time.time() - tick["received_at"]) < max_staleness_seconds:
-        return {"last_price": tick["ltp"], "close": tick.get("close"),
-                "source": "stream", "verified_status": None}
-
-    quote = await UpstoxClient().get_quote_by_keys([instrument_key])
-    upstox_val = next((v for v in quote.values() if v.get("last_price")), None)
-    if not upstox_val:
-        return {"last_price": None, "source": "rest", "verified_status": None}
-
-    consensus_price = upstox_val.get("last_price")
-    verified_status = None
-
-    # Yahoo only has an equivalent quote shape for equities (.NS/.BO), not
-    # index instrument keys — skip verification for indices rather than
-    # forcing a comparison that isn't meaningful.
-    if instrument_key.startswith(("NSE_EQ|", "BSE_EQ|")):
-        try:
-            import asyncio
-            from services.yahoo import YahooFinance
-            from engines.verification import VerificationMembrane
-
-            symbol = _normalize_key(instrument_key)
-            yahoo_quote = await asyncio.to_thread(YahooFinance().get_quote, symbol)
-            yahoo_price = (yahoo_quote or {}).get("current_price")
-            field = VerificationMembrane().verify_price(
-                upstox_price=upstox_val.get("last_price"), yahoo_price=yahoo_price, symbol=symbol,
-            )
-            verified_status = field.status.value
-            if field.consensus_value is not None:
-                consensus_price = field.consensus_value
-        except Exception:
-            pass
-
-    return {**upstox_val, "last_price": consensus_price, "source": "rest",
-            "verified_status": verified_status}

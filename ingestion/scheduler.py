@@ -319,26 +319,11 @@ def schedule_ingestion_jobs():
     return scheduler
 
 
-def run_all_jobs():
-    """Run all ETL jobs immediately (manual trigger / testing)."""
-    logger.info("=== Running all ETL jobs manually ===")
-    for job in JOBS:
-        try:
-            _tracked(job["id"], job["fn"])
-        except Exception as e:
-            logger.error(f"{job['id']} failed: {e}")
-    logger.info("=== All ETL jobs completed ===")
-
-
 # Ad-hoc runs launched from the Settings page. Kept out of the APScheduler
 # thread pool so a manual run can never delay or displace a scheduled one.
 _manual_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="manual-etl")
 _running: set[str] = set()
 _running_lock = threading.Lock()
-
-
-def job_ids() -> list[str]:
-    return [j["id"] for j in JOBS]
 
 
 def is_running(job_id: str) -> bool:
