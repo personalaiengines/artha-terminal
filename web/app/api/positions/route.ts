@@ -7,7 +7,7 @@ import { fromApi } from "@/lib/api-server";
 // reason from /api/system/status). An empty book with a valid token is ok:true
 // and items: [] — a real "no open positions", not an error.
 export async function GET() {
-  const r = await fromApi<any>("/api/positions", 10000);
+  const r = await fromApi<any>("/api/positions", 10000, true);
   if (!r) return NextResponse.json({ ok: false, status: "error", items: [] });
   return NextResponse.json(r);
 }

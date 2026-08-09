@@ -1,6 +1,6 @@
 import {
   LayoutDashboard, LineChart, Wallet, Star, Sparkles, FlaskConical,
-  CandlestickChart, Layers, Newspaper, CalendarClock, Bell, ShieldAlert,
+  CandlestickChart, Layers, LayoutGrid, Newspaper, CalendarClock, Bell, ShieldAlert,
   Settings, type LucideIcon,
 } from "lucide-react";
 
@@ -16,6 +16,9 @@ export const NAV: NavItem[] = [
   { label: "Research", href: "/research", icon: FlaskConical, group: "Intelligence" },
   { label: "News", href: "/news", icon: Newspaper, group: "Intelligence" },
 
+  // LayoutGrid, because it reads as a grid and nothing else uses it: LineChart
+  // is already Markets and F&O, CandlestickChart is Stocks.
+  { label: "Charts", href: "/charts", icon: LayoutGrid, group: "Trading" },
   { label: "Stocks", href: "/stocks", icon: CandlestickChart, group: "Trading" },
   { label: "Options", href: "/options", icon: Layers, group: "Trading" },
   { label: "F&O", href: "/fno", icon: LineChart, group: "Trading" },

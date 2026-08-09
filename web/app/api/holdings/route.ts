@@ -5,7 +5,7 @@ import { fromApi } from "@/lib/api-server";
 // ok:false with an empty book so the UI prompts re-authorization (the banner
 // reads the reason from /api/system/status) rather than faking positions.
 export async function GET() {
-  const r = await fromApi<any>("/api/holdings", 10000);
+  const r = await fromApi<any>("/api/holdings", 10000, true);
   if (!r) return NextResponse.json({ ok: false, status: "error", items: [] });
   return NextResponse.json(r);
 }

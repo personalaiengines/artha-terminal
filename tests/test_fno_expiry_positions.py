@@ -166,9 +166,18 @@ def test_positions_maps_fno_rows_and_drops_everything_else(monkeypatch):
     assert res["ok"] is True
     assert [i["symbol"] for i in res["items"]] == ["NIFTY26AUG24400CE", "SENSEX26AUG80000PE"]
     assert [i["side"] for i in res["items"]] == ["LONG", "SHORT"]
-    # Only the display fields travel — no account-level or instrument internals.
-    assert set(res["items"][0]) == {"symbol", "qty", "side", "avg", "ltp", "pnl",
+    # Only the display fields travel, plus the two that identify the CONTRACT.
+    # realized/unrealized joined them for the P&L tracker; key/multiplier joined
+    # them so the browser can put the row on the tick stream instead of watching
+    # a frozen LTP between polls. Account-level fields — day_buy_value here, and
+    # the ~20 others on a real row — must still not appear.
+    assert set(res["items"][0]) == {"symbol", "key", "multiplier", "qty", "side",
+                                    "avg", "ltp", "pnl", "realized", "unrealized",
                                     "product", "exchange"}
+    assert res["items"][0]["key"] == "NSE_FO|12345"
+    # Absent on the second row's payload: a missing instrument key is None, which
+    # the client skips — never a stale key borrowed from another contract.
+    assert res["items"][1]["key"] is None
 
 
 def test_squared_off_rows_are_counted_not_listed_as_positions(monkeypatch):
@@ -187,7 +196,25 @@ def test_squared_off_rows_are_counted_not_listed_as_positions(monkeypatch):
 
 def test_empty_book_is_a_real_answer_not_an_error(monkeypatch):
     res = _positions_returning(monkeypatch, {"status": "ok", "data": []})
-    assert res == {"ok": True, "status": "ok", "items": [], "closed": 0}
+    assert res == {"ok": True, "status": "ok", "items": [], "closed": 0,
+                   "closedItems": [], "realized": 0.0, "unrealized": 0.0, "net": 0.0}
+
+
+def test_squared_off_pnl_is_kept_for_the_tracker(monkeypatch):
+    """A contract closed today is not an open position, but its booked P&L is
+    the day's result — dropping it made the tracker report only open risk."""
+    res = _positions_returning(monkeypatch, {"status": "ok", "data": [
+        {"exchange": "NFO", "trading_symbol": "NIFTY26AUG24400CE", "quantity": 0,
+         "average_price": 60.0, "last_price": 68.3, "pnl": 900.0,
+         "realised": 900.0, "unrealised": 0.0, "product": "D"},
+        {"exchange": "NFO", "trading_symbol": "NIFTY26AUG24500CE", "quantity": 50,
+         "average_price": 30.0, "last_price": 33.0, "pnl": 150.0,
+         "realised": 0.0, "unrealised": 150.0, "product": "D"},
+    ]})
+    assert res["realized"] == 900.0 and res["unrealized"] == 150.0
+    assert res["net"] == 1050.0
+    assert [i["symbol"] for i in res["closedItems"]] == ["NIFTY26AUG24400CE"]
+    assert [i["symbol"] for i in res["items"]] == ["NIFTY26AUG24500CE"]
 
 
 def test_expired_token_yields_no_items_and_a_message(monkeypatch):

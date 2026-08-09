@@ -15,6 +15,10 @@ export const POLL = {
   universe: 60_000,    // @cached(60)
   systemStatus: 60_000, // _cached_call("system_status", …, 60)
   holdings: 120_000,   // 120
+  // /api/positions is _cached_call(…, 30) — the open F&O book was polled on the
+  // holdings interval, so it re-served the same payload three times before the
+  // cache had anything new to give. Ticks ride on top of this baseline.
+  positions: 30_000,   // 30
   stock: 120_000,      // _stock is @cached(120)
   fno: 120_000,        // build_game_plan cached 120
   pulse: 180_000,      // 180

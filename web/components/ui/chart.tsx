@@ -139,6 +139,109 @@ export function Donut({
   );
 }
 
+// Cumulative curve against a zero baseline. Single series on purpose: the
+// reader's job is "where is the running total now", and a second scale on the
+// same axes would invent a relationship the data doesn't have. Sign is carried
+// by position relative to the zero rule, not by the fill alone.
+export function ZeroArea({
+  data, dataKey = "v", xKey = "t", height = 240,
+  color = "var(--color-accent)",
+  valueFmt = (v: number) => v.toLocaleString("en-IN"),
+  label = "Value",
+}: {
+  data: Record<string, unknown>[]; dataKey?: string; xKey?: string; height?: number;
+  color?: string; valueFmt?: (v: number) => string; label?: string;
+}) {
+  const id = `za-${dataKey}`;
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <AreaChart data={data} margin={{ top: 8, right: 6, left: 0, bottom: 0 }}>
+        <defs>
+          <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity={0.3} />
+            <stop offset="100%" stopColor={color} stopOpacity={0} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid {...GRID} />
+        <XAxis dataKey={xKey} {...AXIS} minTickGap={44} />
+        <YAxis {...AXIS} width={52} orientation="right" domain={["auto", "auto"]}
+               tickFormatter={(v) => valueFmt(Number(v))} />
+        <ReferenceLine y={0} stroke="var(--color-line)" ifOverflow="extendDomain" />
+        <Tooltip
+          cursor={{ stroke: "var(--color-muted)", strokeWidth: 1 }}
+          content={({ active, payload, label: l }) =>
+            active && payload?.length ? (
+              <TooltipBox>
+                <div className="mb-0.5 text-muted">{String(l)}</div>
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full" style={{ background: color }} />
+                  <span className="text-mist">{label}</span>
+                  <span className="ml-auto font-semibold text-frost tnum">{valueFmt(Number(payload[0].value))}</span>
+                </div>
+              </TooltipBox>
+            ) : null
+          }
+        />
+        <Area type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2}
+              fill={`url(#${id})`} dot={false} animationDuration={800}
+              activeDot={{ r: 4, fill: color, stroke: "var(--color-elevated)", strokeWidth: 2 }} />
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+// Vertical columns diverging around zero — per-session P&L. Above/below the
+// zero rule is the primary encoding of sign; the up/down colors reinforce it
+// but never carry it alone (they are 3.8 ΔE apart under deuteranopia, so a
+// red/green-only chart is unreadable for a red-green colorblind reader).
+export function ZeroColumns({
+  data, dataKey = "v", xKey = "t", height = 200,
+  valueFmt = (v: number) => v.toLocaleString("en-IN"),
+}: {
+  data: Record<string, unknown>[]; dataKey?: string; xKey?: string;
+  height?: number; valueFmt?: (v: number) => string;
+}) {
+  // Rounded far-from-zero end only — the end that touches the baseline stays
+  // square, so the bar reads as anchored rather than floating.
+  const RoundedEnd = (p: any) => {
+    const { x, y, width, height: h, fill } = p;
+    if (!h) return <g />;
+    const r = Math.min(4, width / 2, Math.abs(h));
+    const up = (p[dataKey] ?? 0) >= 0;
+    const d = up
+      ? `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + width - r},${y} Q${x + width},${y} ${x + width},${y + r} L${x + width},${y + h} Z`
+      : `M${x},${y} L${x},${y + h - r} Q${x},${y + h} ${x + r},${y + h} L${x + width - r},${y + h} Q${x + width},${y + h} ${x + width},${y + h - r} L${x + width},${y} Z`;
+    return <path d={d} fill={fill} />;
+  };
+
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <BarChart data={data} margin={{ top: 8, right: 6, left: 0, bottom: 0 }} barCategoryGap="18%">
+        <CartesianGrid {...GRID} />
+        <XAxis dataKey={xKey} {...AXIS} minTickGap={44} />
+        <YAxis {...AXIS} width={52} orientation="right" tickFormatter={(v) => valueFmt(Number(v))} />
+        <ReferenceLine y={0} stroke="var(--color-line)" ifOverflow="extendDomain" />
+        <Tooltip
+          cursor={{ fill: "var(--color-raised)", opacity: 0.35 }}
+          content={({ active, payload, label }) =>
+            active && payload?.length ? (
+              <TooltipBox>
+                <div className="mb-0.5 text-muted">{String(label)}</div>
+                <div className="font-semibold text-frost tnum">{valueFmt(Number(payload[0].value))}</div>
+              </TooltipBox>
+            ) : null
+          }
+        />
+        <Bar dataKey={dataKey} shape={RoundedEnd} animationDuration={800} maxBarSize={22}>
+          {data.map((d, i) => (
+            <Cell key={i} fill={Number(d[dataKey]) >= 0 ? "var(--color-up)" : "var(--color-down)"} />
+          ))}
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
 // Horizontal diverging bars — OI, gainers/losers, attribution.
 export function HBars({
   data, height = 220, fmt = (v: number) => String(v),

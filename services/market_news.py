@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from agent.prompts import COMPLIANCE, GROUNDING, HOUSE_STYLE
@@ -107,6 +107,89 @@ def _is_publisher(url: str) -> bool:
     return not any(host == d or host.endswith("." + d) for d in _NOT_A_PUBLISHER)
 
 
+# A section front is not a story. Web search ranks these top for every "... news
+# today" query — an outlet's markets landing page, a broker's quote page, a
+# screener tool — and they never carry a date, so nothing downstream could age
+# them out. Worse, handing one to the curator invites it to invent a headline:
+# "Sensex gains modestly while Nifty declines in early trade" was written for
+# thehindu.com/business/markets/, whose real title is just "Stock Market Today".
+_SECTION_SLUGS = {
+    "markets", "market", "equity", "equities", "news", "stocks", "stock",
+    "business", "indices", "index", "quote", "quotes", "live", "home",
+    "sector-performance", "top-gainers-today", "stocksmarketsindia",
+}
+
+
+def _is_article(url: str) -> bool:
+    """True when a URL looks like one story rather than a section front.
+
+    Judged on the last path segment: a story slug is long and hyphenated, or
+    ends in a numeric article id (`/articleshow/12345678.cms`). A section is a
+    short bare noun. Deliberately shape-based — there is no date in a search
+    result to check, and fetching every candidate to find out would cost a
+    round-trip per hit.
+    """
+    m = re.match(r"https?://[^/]+(/.*)?$", url or "")
+    if not m:
+        return False
+    path = (m.group(1) or "/").split("?")[0].split("#")[0]
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return False  # bare domain: nseindia.com/
+    last = segments[-1].lower()
+    if "." in last:
+        last = last.rsplit(".", 1)[0]  # strip .html/.cms/.ece
+    if last in _SECTION_SLUGS:
+        return False
+    if re.search(r"\d{5,}", last):
+        return True  # publisher article id
+    return last.count("-") >= 3 or len(last) >= 28
+
+
+def _age_hours(published: str | None) -> float | None:
+    """Hours since `published`, or None when the item carries no date."""
+    if not published:
+        return None
+    try:
+        dt = datetime.fromisoformat(published)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+# Dated items older than this are dropped outright. A trading desk's feed is
+# worthless at two days; it was carrying a 2017 CNBC article.
+_MAX_AGE_HOURS = 48
+
+# Article URLs often embed the publication date. It is the only age signal a
+# search hit has — RSS and Finnhub carry a real timestamp, search carries none —
+# and it is exactly what catches /amp/2017/07/19/.
+_URL_DATE = re.compile(r"/(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?:[/-]|$)")
+
+
+def _age_tag(published: str | None) -> str:
+    """" (2h)" / " (3d)" / " (undated)" — shown against each row in the curation
+    prompt so "select recent items" is something the model can actually see
+    rather than a word it has to take on faith."""
+    age = _age_hours(published)
+    if age is None:
+        return " (undated)"
+    return f" ({int(age)}h)" if age < 48 else f" ({int(age / 24)}d)"
+
+
+def _date_from_url(url: str) -> str | None:
+    m = _URL_DATE.search(url or "")
+    if not m:
+        return None
+    try:
+        y, mo, d = (int(g) for g in m.groups())
+        return datetime(y, mo, d, tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
 def _domain(url: str) -> str:
     """Publisher name from a URL, e.g. 'economictimes.indiatimes.com' -> 'Economictimes'."""
     m = re.search(r"https?://(?:www\.)?([^/]+)", url or "")
@@ -117,43 +200,77 @@ def _domain(url: str) -> str:
 
 
 def _gather() -> list[dict]:
-    """Run all queries and dedupe by link, then by title. Also folds in
-    Finnhub general market news (REST poll, additive to the SerpAPI/SearxNG
-    queries above) through the same dedup pass.
+    """Every source, deduped by link then title, freshest first.
 
-    Each hit carries the `region` of the query that found it, so the fallback
-    path (LLM unavailable) still splits India vs. international correctly."""
+    Order matters and is the opposite of what it used to be. RSS and Finnhub run
+    BEFORE search because they are the only sources that carry a real
+    publication time, and `_interleave` downstream takes a head slice: with
+    search first, the 32 RSS articles gathered every cycle sat at India index 26
+    and beyond, so **none of them ever reached the curator**. The feed was
+    ranking search hits exclusively while the freshest, properly-dated,
+    real-article source was collected and thrown away.
+
+    Each hit carries the `region` of the source that found it, so the fallback
+    path (LLM unavailable) still splits India vs. international correctly, plus
+    `published` (ISO-8601 UTC, or None when nothing could date it).
+    """
     seen_links: set[str] = set()
     seen_titles: set[str] = set()
     out: list[dict] = []
 
-    def _add(title: str, link: str, snippet: str, region: str) -> None:
+    def _add(title: str, link: str, snippet: str, region: str,
+             published: str | None = None) -> None:
         title = (title or "").strip()
         link = (link or "").strip()
-        if not title or not _is_publisher(link):
+        if not title or not _is_publisher(link) or not _is_article(link):
             return
         tkey = title.lower()[:80]
         if (link and link in seen_links) or tkey in seen_titles:
+            return
+        # Search results have no date of their own; the URL is the only signal.
+        published = published or _date_from_url(link)
+        age = _age_hours(published)
+        if age is not None and age > _MAX_AGE_HOURS:
             return
         if link:
             seen_links.add(link)
         seen_titles.add(tkey)
         out.append({"title": title, "link": link,
-                    "snippet": (snippet or "").strip(), "region": region})
+                    "snippet": (snippet or "").strip(), "region": region,
+                    "published": published})
 
-    for q, region in _QUERIES:
-        for r in _search(q):
-            _add(r.get("title"), r.get("link"), r.get("snippet"), region)
+    try:
+        from services.india_news import get_india_market_news
+        # Publisher RSS: the freshest source there is (items minutes old) and
+        # the only Indian one that survives SerpAPI's spent quota.
+        for r in get_india_market_news():
+            _add(r.get("title"), r.get("link"), r.get("snippet"), "india", r.get("published"))
+    except Exception:
+        pass
 
     try:
         from services.finnhub_news import get_finnhub_general_news
         # Finnhub's `general` category is US/world wire copy, not Indian.
         for r in get_finnhub_general_news():
-            _add(r.get("title"), r.get("link"), r.get("snippet"), "global")
+            _add(r.get("title"), r.get("link"), r.get("snippet"), "global", r.get("published"))
     except Exception:
         pass
 
-    return out
+    for q, region in _QUERIES:
+        for r in _search(q):
+            _add(r.get("title"), r.get("link"), r.get("snippet"), region)
+
+    # Newest first, undated last. Undated hits are search results, which are the
+    # least trustworthy rung on recency — but they are not dropped, because "no
+    # date found" is not evidence of being old.
+    #
+    # Sorted on the parsed instant, not the ISO string: string order is only
+    # equivalent while every timestamp is UTC, and that is an invariant three
+    # separate modules would have to keep.
+    dated = [r for r in out if r["published"]]
+    undated = [r for r in out if not r["published"]]
+    dated.sort(key=lambda r: _age_hours(r["published"]) or 0.0)
+    return dated + undated
 
 
 def session_phase() -> str:
@@ -211,7 +328,18 @@ _MAX_HIGH_IMPACT = 3
 # other number is how the Global tab ended up near-empty. Overnight US/Europe/
 # Asia, central banks, crude, gold and the dollar set the Indian open, so four
 # of fourteen is a reasonable share of an Indian desk's feed, not a courtesy.
-_MIN_GLOBAL = 4
+_MIN_GLOBAL_SHARE = 2 / 7
+
+
+def _min_global(limit: int) -> int:
+    """The international floor, as a share of the feed rather than a fixed count.
+
+    It was 4, justified as "four of fourteen is a reasonable share of an Indian
+    desk's feed". That reasoning is about the *proportion*, so a fixed 4 quietly
+    breaks the moment `limit` moves — at 24 items it would have meant 17% where
+    the author intended 29%.
+    """
+    return max(1, round(limit * _MIN_GLOBAL_SHARE))
 
 # How many raw hits the curation prompt carries. The gather step now returns
 # ~80 (ten queries plus the Finnhub poll); sending them all put the request over
@@ -272,7 +400,8 @@ def _curate(raw: list[dict], limit: int, phase: str) -> tuple[list[dict], dict |
 
     pool = _interleave(raw)
     lines = "\n".join(
-        f"{i+1}. [{r.get('region','india')}] {r['title']} | {r['snippet'][:120]}"
+        f"{i+1}. [{r.get('region','india')}]{_age_tag(r.get('published'))} "
+        f"{r['title']} | {r['snippet'][:120]}"
         for i, r in enumerate(pool)
     )
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
@@ -286,18 +415,19 @@ def _curate(raw: list[dict], limit: int, phase: str) -> tuple[list[dict], dict |
         f'{{"briefing":{{"headline":"<one sentence, the single most important thing>",'
         f'"points":["<3-5 short points, each a concrete takeaway tied to a headline above>"],'
         f'"watch":["<2-3 specific things to watch next>"]}},'
-        f'"items":[{{"n":<the number of the result above>,"headline":"<concise, factual>",'
+        f'"items":[{{"n":<the number of the result above>,'
         f'"why":"<max 15 words on why it matters to an Indian investor>","category":'
         f'"<Markets|Stocks|Macro|Policy|Global>","region":"<india|global>",'
         f'"impact":"<high|medium|low>","tickers":["<NSE symbol>"]}}]}}\n\n'
         f"Rules: write the briefing FIRST, then select the {limit} MOST "
         f"market-relevant, distinct, recent items. Cite each item by its number "
-        f"`n` only — never write out a URL. At least {_MIN_GLOBAL} of the "
+        f"`n` only — never write out a URL. You do NOT write headlines: the "
+        f"publisher's own headline is used verbatim, so pick the row and explain "
+        f"why it matters, nothing more. Prefer rows marked with a smaller age. "
+        f"At least {_min_global(limit)} of the "
         f"{limit} must be region \"global\": overnight US/Europe/Asia moves, "
         f"central banks, crude, gold and the dollar set the Indian open, so "
-        f"they are market news here too. Skip results that are reference or "
-        f"landing pages rather than a story — an institution's \"about\" page "
-        f"is not a headline. Mark at most 3 items \"high\" "
+        f"they are market news here too. Mark at most 3 items \"high\" "
         f"impact, and only for news that genuinely demands attention today "
         f"(policy decisions, large earnings surprises, sharp commodity/currency "
         f"moves, market-wide events). `tickers` may be empty; only list NSE "
@@ -310,6 +440,9 @@ def _curate(raw: list[dict], limit: int, phase: str) -> tuple[list[dict], dict |
 
     valid_links = {r["link"] for r in raw if r.get("link")}
     region_by_link = {r["link"]: r.get("region", "india") for r in raw if r.get("link")}
+    # The gathered row behind each link — the source of the headline and the
+    # publication time, neither of which the model is trusted to supply.
+    by_link = {r["link"]: r for r in raw if r.get("link")}
 
     def _blocks(text: str) -> list:
         """Every top-level JSON value we can salvage from the reply."""
@@ -403,13 +536,22 @@ def _curate(raw: list[dict], limit: int, phase: str) -> tuple[list[dict], dict |
         for it in rows if isinstance(rows, list) else []:
             if not isinstance(it, dict):
                 continue
-            head = str(it.get("headline", "")).strip()
             url = _link_for(it)
-            # No head or no groundable source -> drop it. Index citation also
-            # makes duplicates possible in a way free-text URLs weren't, since
-            # the model can name the same row twice.
-            if not head or not url or url in seen:
+            # No groundable source -> drop it. Index citation also makes
+            # duplicates possible in a way free-text URLs weren't, since the
+            # model can name the same row twice.
+            if not url or url in seen:
                 continue
+            src = by_link.get(url)
+            if not src:
+                continue
+            # The publisher's headline, verbatim — the model no longer writes
+            # one. It used to, and against a section front with nothing to
+            # summarise it simply invented the specifics: "Sensex gains modestly
+            # while Nifty declines in early trade" was composed for a page whose
+            # real title is "Stock Market Today: Sensex, Nifty, BSE, NSE Latest
+            # Updates". A made-up market claim is worse than no headline.
+            head = src["title"]
             if _near_dupe(head, [i["title"] for i in items]):
                 continue
             seen.add(url)
@@ -428,6 +570,7 @@ def _curate(raw: list[dict], limit: int, phase: str) -> tuple[list[dict], dict |
                 "region": region if region in _REGIONS else region_by_link.get(url, "india"),
                 "impact": impact if impact in _IMPACTS else "low",
                 "tickers": tickers,
+                "published": src.get("published"),
             })
         # The prompt asks for at most three "high" items; nothing made that
         # binding, and a run that flags ten turns the Alerts page from "these
@@ -492,13 +635,13 @@ def _as_item(r: dict) -> dict:
     """
     return {"title": r["title"], "link": r["link"], "snippet": r["snippet"],
             "source": _domain(r["link"]), "region": r.get("region", "india"),
-            "impact": "low", "tickers": []}
+            "impact": "low", "tickers": [], "published": r.get("published")}
 
 
 def _ensure_global(items: list[dict], raw: list[dict], limit: int) -> list[dict]:
-    """Guarantee at least _MIN_GLOBAL international items, without growing the
+    """Guarantee at least _min_global(limit) international items, without growing the
     list — the lowest-ranked domestic items give up their slots."""
-    need = _MIN_GLOBAL - _global_count(items)
+    need = _min_global(limit) - _global_count(items)
     if need <= 0:
         return items
     seen = {i["link"] for i in items}
@@ -516,7 +659,7 @@ def _ensure_global(items: list[dict], raw: list[dict], limit: int) -> list[dict]
     return keep + extra
 
 
-def get_live_market_news(limit: int = 14) -> dict:
+def get_live_market_news(limit: int = 24) -> dict:
     """
     Live, LLM-curated Indian + international market news, plus a session-aware
     AI briefing (pre-open / mid-session / post-close).
@@ -528,12 +671,23 @@ def get_live_market_news(limit: int = 14) -> dict:
          "generated_ist": iso, "count": int}
     Never caches an empty result (callers should not cache failures either).
 
-    `limit` is deliberately modest. Every free tier in the chain shares one
-    ~4k completion budget with its own reasoning tokens, and asking for a
-    ranked list much longer than this returns finish_reason=length: the
-    briefing survives (it is written first) but most of the item list is lost
-    and gets silently replaced by unranked raw hits. Fourteen ranked items
-    beats twenty where six are ranked and fourteen are search noise.
+    `limit` was 14, because every free tier in the chain shares one ~4k
+    completion budget with its own reasoning tokens and a longer ranked list
+    came back finish_reason=length — the briefing survived (it is written
+    first) but most of the items were lost and silently replaced by unranked
+    raw hits.
+
+    That ceiling moved when the curator stopped writing headlines. Each item is
+    now `{n, why, category, region, impact, tickers}` and the publisher's own
+    headline is used verbatim, so the largest per-item output cost is gone.
+    Measured against the live pipeline afterwards: limit=30 returned 25 ranked
+    items with an intact briefing in 11.7s. 24 sits inside that with margin and
+    matches the slice in web/app/api/news/route.ts, so nothing is fetched only
+    to be clipped by the UI.
+
+    Two ceilings remain above it. `_PROMPT_HITS` (30) is a hard cap on ranked
+    items — the curator cannot rank a row it was never shown — and raising THAT
+    is what previously produced 413 Payload Too Large on the leading tier.
     """
     phase = session_phase()
     raw = _gather()
@@ -561,7 +715,7 @@ def get_live_market_news(limit: int = 14) -> dict:
         # filled an entirely empty feed with 14 international items the one time
         # curation failed outright — an Indian terminal showing no Indian
         # headlines. The floor is a minimum, not an ordering.
-        need = min(max(0, _MIN_GLOBAL - _global_count(curated)), limit - len(curated))
+        need = min(max(0, _min_global(limit) - _global_count(curated)), limit - len(curated))
         for r in [x for x in pending if x.get("region") == "global"][:need]:
             curated.append(_as_item(r))
             seen.add(r["link"])

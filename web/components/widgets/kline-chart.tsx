@@ -1,22 +1,25 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  CandleType, DomPosition, IndicatorSeries, LineType, OverlayMode, PolygonType, YAxisType,
+  ActionType, CandleType, DomPosition, FormatDateType, IndicatorSeries, LineType, OverlayMode, PolygonType,
+  TooltipShowType, YAxisType,
   dispose, init, registerIndicator, registerOverlay,
   type Chart, type KLineData, type OverlayCreate,
 } from "klinecharts";
 import {
-  BookOpen, Eye, EyeOff, Keyboard, Magnet, Maximize2, Minimize2, Minus, MousePointer2, MoveUpRight,
-  MoveVertical, Ruler, SlidersHorizontal, Trash2, TrendingUp, Undo2,
+  BookOpen, Eye, EyeOff, Keyboard, Magnet, Maximize2, Minimize2, Minus, MoreHorizontal,
+  MousePointer2, MoveUpRight, MoveVertical, Ruler, SlidersHorizontal, Trash2, TrendingUp, Undo2,
 } from "lucide-react";
 import { KIND_COLOR } from "@/components/widgets/level-ladder";
 import { type Level, type Timeframe } from "@/components/ui/candles";
 import {
-  drawKey, isDrawing, prefsKey, readJson, remove as removeStored, toSaved, writeJson,
-  type SavedDrawing,
+  clearDrawings, drawKey, isDrawing, migrateLegacyPrefs, onDrawingsChanged, prefsKey, readJson,
+  toSaved, writeDrawings, writeJson, type SavedDrawing,
 } from "@/lib/chart-store";
+import { labelBudget, openBarSpace, pickLabels, shortLevelLabel } from "@/lib/chart-layout";
+import { getOnce } from "@/lib/fetch-cache";
 import { vwap } from "@/lib/indicators";
-import { IST_MS, foldTick, istDate, tickTime } from "@/lib/live-bar";
+import { IST_MS, foldTick, isStreaming, istDate, tickTime } from "@/lib/live-bar";
 import { useMarketWs } from "@/lib/use-ws";
 import { cn } from "@/lib/utils";
 
@@ -62,7 +65,9 @@ const RESOLUTIONS = [
   { label: "1h", res: "60", days: 30, minutes: 60 },
   { label: "1D", res: "1D", days: 0, minutes: 0 },
 ] as const;
-type ResLabel = typeof RESOLUTIONS[number]["label"];
+/** Exported so a page holding several charts can name the resolution it drives
+ *  one with, and persist it. */
+export type ResLabel = typeof RESOLUTIONS[number]["label"];
 
 const TYPES: { label: string; value: ChartType }[] = [
   { label: "Candles", value: "candles" }, { label: "Hollow", value: "hollow" },
@@ -190,6 +195,9 @@ const INTRADAY_POLL_MS = 60_000;
 
 const RANGES: Timeframe[] = ["1M", "3M", "6M", "1Y"];
 
+/** Where the OHLC legend sits. Level names keep clear of it. */
+const LEGEND_Y = 16;
+
 /** The setup that survives a reload. Resolution is deliberately NOT in here: the
  *  page opens on 15m by design, and a chart that opens wherever it was last left
  *  makes that default unreadable. */
@@ -224,6 +232,23 @@ const label = (ms: number) => {
   const d = new Date(ms + IST_MS);
   return `${d.getUTCDate()} ${d.toLocaleString("en-GB", { month: "short", timeZone: "UTC" })} `
     + `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+};
+
+// Every date the chart draws, in IST and in one house style.
+//
+// KLineChart's defaults produced three different formats on one axis — "07-15",
+// then "2026-08" where the month rolled over, and "15:15" intraday — so the same
+// row read as three kinds of thing. The library still decides the tick SPACING
+// (it hands us the format string it would have used); this only decides how the
+// result is spelled: "15:15" for an intraday tick, "05 Aug" for a date one, and
+// the full "05 Aug 2026 15:15" wherever a single moment is quoted.
+const fmtDate = (_dtf: Intl.DateTimeFormat, timestamp: number, format: string, type: FormatDateType) => {
+  const d = new Date(timestamp + IST_MS);
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const mon = d.toLocaleString("en-GB", { month: "short", timeZone: "UTC" });
+  const hm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+  if (type === FormatDateType.XAxis) return format.includes("HH") ? hm : `${dd} ${mon}`;
+  return `${dd} ${mon} ${d.getUTCFullYear()} ${hm}`;
 };
 
 /** The session each bar belongs to — VWAP and TWAP re-anchor when it changes.
@@ -283,10 +308,23 @@ registerIndicator<{ twap?: number }>({
   },
 });
 
-// A level's tag on the price axis, copied from the library's simpleTag with one
-// change: both figures ignore events. The built-in consumes the drag, and eight
-// levels stacked near spot made the top of the price axis dead to the mouse and
-// to touch — the axis could not be rescaled where the levels actually are.
+/** What a level line carries. `label: false` draws the line and no name. */
+type TagData = { text: string; label?: boolean };
+
+// A level line, with its name written ON the line rather than stamped into the
+// price scale.
+//
+// It used to put every label in the y-axis gutter, right-aligned to the axis
+// edge. With a dozen levels — which is the normal count here, not the worst case
+// — that gutter became a solid wall of coloured chips: they overlapped each
+// other, the longer names ("Prev Day High", "Call OI Wall") ran off the left of
+// the axis and were clipped mid-word, and they buried the price ticks. The one
+// column of a price chart that must always be readable is the price.
+//
+// So: the price scale carries prices (plus SPOT, the single line worth pinning
+// there), and a level's identity rides on the line, which is where the eye
+// already is. Both figures ignore events — the built-in tag consumes the drag,
+// and levels stacked near spot made the axis dead to the mouse and to touch.
 registerOverlay({
   name: "levelTag",
   totalStep: 2,
@@ -294,16 +332,25 @@ registerOverlay({
   needDefaultPointFigure: false,
   needDefaultXAxisFigure: false,
   needDefaultYAxisFigure: false,
-  createPointFigures: ({ coordinates, bounding }) => [{
-    type: "line",
-    attrs: { coordinates: [{ x: 0, y: coordinates[0].y }, { x: bounding.width, y: coordinates[0].y }] },
-    ignoreEvent: true,
-  }],
-  createYAxisFigures: ({ overlay, coordinates, bounding }) => ({
-    type: "text",
-    attrs: { x: bounding.width, y: coordinates[0].y, text: String(overlay.extendData ?? ""), align: "right", baseline: "middle" },
-    ignoreEvent: true,
-  }),
+  createPointFigures: ({ overlay, coordinates, bounding }) => {
+    const d = (overlay.extendData ?? {}) as TagData;
+    const y = coordinates[0].y;
+    const figures: ReturnType<NonNullable<Parameters<typeof registerOverlay>[0]["createPointFigures"]>> = [{
+      type: "line",
+      attrs: { coordinates: [{ x: 0, y }, { x: bounding.width, y }] },
+      ignoreEvent: true,
+    }];
+    if (d.text && d.label !== false) {
+      // Sits just above its own line, at the left margin, so it never covers the
+      // most recent bars — the ones being read.
+      figures.push({
+        type: "text",
+        attrs: { x: 4, y: y - 3, text: d.text, align: "left", baseline: "bottom" },
+        ignoreEvent: true,
+      });
+    }
+    return figures;
+  },
 });
 
 // A confluence zone is a RANGE, not a line, and no built-in overlay fills a
@@ -338,12 +385,28 @@ const STYLES = {
     ] },
     priceMark: {
       high: { color: C.faint }, low: { color: C.faint },
+      // The last-price chip sits ON TOP of whatever axis tick shares its row —
+      // the library draws both, it does not hide the one underneath. So the chip
+      // has to be at least as wide as a tick or the tick's tail shows past it.
+      // It was 11px against 12px ticks, which is exactly what left a stray digit
+      // hanging off the chip's right edge. Same size, and padding to spare.
       last: { upColor: C.up, downColor: C.down, noChangeColor: C.muted,
-        text: { color: C.void, size: 11 } },
+        text: { color: C.void, size: 12, paddingLeft: 6, paddingRight: 6 } },
     },
+    // The desk legend, in the order every terminal writes it. The library's own
+    // default spelled out "Time: … Open: … High: …" as one long grey sentence;
+    // this is the OHLC line a trader actually reads, with the values taking the
+    // bar's own direction so the colour says something.
     tooltip: {
-      text: { color: C.mist, size: 11 },
+      showType: TooltipShowType.Standard,
+      text: { color: C.mist, size: 12, marginLeft: 8, marginTop: 6 },
       rect: { color: "transparent", borderColor: "transparent" },
+      custom: ({ current }: { current: KLineData }) => {
+        const tone = current.close >= current.open ? C.up : C.down;
+        const n = (v: number) => v.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        return ([["O", current.open], ["H", current.high], ["L", current.low], ["C", current.close]] as const)
+          .map(([k, v]) => ({ title: { text: `${k} `, color: C.faint }, value: { text: n(v), color: tone } }));
+      },
     },
   },
   indicator: {
@@ -352,13 +415,24 @@ const STYLES = {
   },
   // Axis text was #545c6b on a near-black pane — about 3:1, under WCAG AA for
   // small text, and the first thing anyone squinted at. The ticks are the chart's
-  // units; they read at #b6bdcc (~8:1) and one size larger.
-  xAxis: { axisLine: { color: C.line }, tickLine: { color: C.line }, tickText: { color: C.mist, size: 11 } },
-  yAxis: { axisLine: { color: C.line }, tickLine: { color: C.line }, tickText: { color: C.mist, size: 11 } },
+  // units; they read at #b6bdcc (~8:1) and one size larger again at 12px, which
+  // is where "24,800.00" stops needing a second look.
+  //
+  // The price scale is pinned to a fixed width rather than sized to its content:
+  // it is the column the eye returns to, and an axis that changes width as the
+  // range moves makes the whole chart shift under the cursor.
+  xAxis: {
+    axisLine: { color: C.line }, tickLine: { color: C.line },
+    tickText: { color: C.mist, size: 12, marginStart: 6, marginEnd: 6 },
+  },
+  yAxis: {
+    size: 76, axisLine: { color: C.line }, tickLine: { color: C.line },
+    tickText: { color: C.mist, size: 12, marginStart: 8, marginEnd: 8 },
+  },
   separator: { color: C.line },
   crosshair: {
-    horizontal: { line: { color: C.mist }, text: { backgroundColor: C.frost, color: C.void, size: 11, weight: "bold" } },
-    vertical: { line: { color: C.mist }, text: { backgroundColor: C.frost, color: C.void, size: 11, weight: "bold" } },
+    horizontal: { line: { color: C.mist }, text: { backgroundColor: C.frost, color: C.void, size: 12, weight: "bold" } },
+    vertical: { line: { color: C.mist }, text: { backgroundColor: C.frost, color: C.void, size: 12, weight: "bold" } },
   },
   overlay: { point: { color: C.accent, borderColor: fade(C.accent, 0.35) } },
 };
@@ -393,6 +467,7 @@ function Toggle({ on, onClick, disabled, title, children }: {
 
 export function KlineChart({
   symbol, liveKey, data, levels = [], spot, height = 440, timeframe, onTimeframe,
+  prefsScope = "fno", compact = false, res: resProp, onRes,
 }: {
   symbol: string;
   /** the name the tick socket knows this index by ("nifty50"); omit for no stream */
@@ -401,11 +476,23 @@ export function KlineChart({
   data: Candle[];
   levels?: Level[];
   spot?: number | null;
-  height?: number;
+  /** px, or "fill" to take the height of the grid cell this chart sits in */
+  height?: number | "fill";
   timeframe?: Timeframe;
   onTimeframe?: (tf: Timeframe) => void;
+  /** which saved setup this chart owns. Charts sharing a page must not share
+   *  one — each writes the whole prefs object on every change. */
+  prefsScope?: string;
+  /** one toolbar row plus an overflow menu, for a pane too narrow for three */
+  compact?: boolean;
+  /** with `onRes`, the resolution is the caller's to own (a page persists it per
+   *  pane); without them the chart keeps its own, opening on 15m */
+  res?: ResLabel;
+  onRes?: (r: ResLabel) => void;
 }) {
-  const [res, setRes] = useState<ResLabel>("15m");
+  const [ownRes, setOwnRes] = useState<ResLabel>("15m");
+  const res = resProp ?? ownRes;
+  const setRes = (r: ResLabel) => (onRes ? onRes(r) : setOwnRes(r));
   const [type, setType] = useState<ChartType>("candles");
   const [scale, setScale] = useState<Scale>("normal");
   const [ind, setInd] = useState<Record<IndKey, boolean>>({
@@ -415,12 +502,13 @@ export function KlineChart({
   const [tool, setTool] = useState<string | null>(null);
   const [magnet, setMagnet] = useState(false);
   const [ready, setReady] = useState(false);
-  const [streaming, setStreaming] = useState(false);
+  const [lastTickAt, setLastTickAt] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [showLevels, setShowLevels] = useState(true);
   const [help, setHelp] = useState(false);
   const [guide, setGuide] = useState(false);
   const [picker, setPicker] = useState(false);
+  const [more, setMore] = useState(false);   // compact mode's overflow menu
   // Levels hidden by name. Absent = drawn, so a level the engine adds later shows
   // up rather than inheriting someone's old filter.
   const [hidden, setHidden] = useState<Set<string>>(new Set());
@@ -429,12 +517,19 @@ export function KlineChart({
   // without a mouse: the cursor walks the bars and every stop is announced.
   const [cursor, setCursor] = useState<number | null>(null);
 
+  // Per instance: a page can hold several charts, and a literal id would give
+  // them all the same one — every chart's description resolving to the first.
+  // The same value doubles as this chart's writer token for drawings, which
+  // needs exactly the same property: unique per instance.
+  const readoutId = useId();
+
   // Saved setup is applied AFTER the first render, not read into useState: the
   // server renders this markup too, and localStorage on the client would make the
   // two disagree. One extra paint beats a hydration mismatch.
   const restored = useRef(false);
   useEffect(() => {
-    const p = readJson<Partial<Prefs>>(prefsKey(), {});
+    migrateLegacyPrefs(prefsScope);
+    const p = readJson<Partial<Prefs>>(prefsKey(prefsScope), {});
     if (p.type) setType(p.type);
     if (p.scale) setScale(p.scale);
     if (typeof p.showLevels === "boolean") setShowLevels(p.showLevels);
@@ -443,12 +538,12 @@ export function KlineChart({
     if (p.ind) setInd((cur) => ({ ...cur, ...p.ind }));
     if (Array.isArray(p.hidden)) setHidden(new Set(p.hidden.filter((h) => typeof h === "string")));
     restored.current = true;
-  }, []);
+  }, [prefsScope]);
 
   useEffect(() => {
     if (!restored.current) return;   // don't write defaults over the saved setup
-    writeJson(prefsKey(), { type, scale, showLevels, ind, hidden: [...hidden] } satisfies Prefs);
-  }, [type, scale, showLevels, ind, hidden]);
+    writeJson(prefsKey(prefsScope), { type, scale, showLevels, ind, hidden: [...hidden] } satisfies Prefs);
+  }, [prefsScope, type, scale, showLevels, ind, hidden]);
 
   const spec = RESOLUTIONS.find((r) => r.label === res)!;
   const intraday = res !== "1D";
@@ -459,22 +554,33 @@ export function KlineChart({
   // Daily rows are "YYYY-MM-DD"; stored at UTC midnight of the trading date and
   // read back in IST (see istDate). Non-increasing rows are dropped rather than
   // handed to the chart out of order.
-  const daily: KLineData[] = data
+  //
+  // Memoised on `data`, and that is not a micro-optimisation: a new array every
+  // render re-runs the data effect below, whose incremental branch replays every
+  // stored bar from `lastRef` forward. On 1D the folded live bar carries the
+  // stored bar's own timestamp, so the replay overwrote the tick with the API's
+  // settled close — inside the same frame — while the pill still said streaming.
+  const daily: KLineData[] = useMemo(() => data
     .map((d) => ({
       timestamp: Date.parse(`${d.t}T00:00:00Z`),
       open: d.open, high: d.high, low: d.low, close: d.close, volume: d.volume,
     }))
-    .filter((b, i, a) => Number.isFinite(b.timestamp) && (i === 0 || b.timestamp > a[i - 1].timestamp));
+    .filter((b, i, a) => Number.isFinite(b.timestamp) && (i === 0 || b.timestamp > a[i - 1].timestamp)), [data]);
 
   useEffect(() => {
     if (!intraday) return;
     let alive = true;
     setIntra({ status: "loading", bars: [] });
     const load = () => {
-      const to = Math.floor(Date.now() / 1000);
+      // Rounded to the poll cycle, so two charts on the same (symbol, resolution)
+      // build the SAME url and share one request. The raw seconds would differ by
+      // whenever each of them mounted and coalesce nothing.
+      const to = Math.floor(Date.now() / INTRADAY_POLL_MS) * (INTRADAY_POLL_MS / 1000);
       const from = to - spec.days * 86400;
-      fetch(`/api/udf/history?symbol=${encodeURIComponent(symbol)}&resolution=${spec.res}&from=${from}&to=${to}`)
-        .then((r) => r.json())
+      getOnce<any>(
+        `/api/udf/history?symbol=${encodeURIComponent(symbol)}&resolution=${spec.res}&from=${from}&to=${to}`,
+        INTRADAY_POLL_MS - 5_000,
+      )
         .then((j) => {
           if (!alive) return;
           if (j?.s === "ok" && Array.isArray(j.t) && j.t.length) {
@@ -507,11 +613,15 @@ export function KlineChart({
   const lastRef = useRef<KLineData | null>(null);
   const panesRef = useRef<Partial<Record<IndKey, string>>>({});
   const drawnRef = useRef<string[]>([]);  // user drawings, newest last (undo stack)
+  const pendingRef = useRef<string | null>(null);  // the overlay an armed tool is waiting on
+  // Spot for the levels effect to read without depending on it — see below.
+  const spotRef = useRef<number | null | undefined>(spot);
+  spotRef.current = spot;
 
   useEffect(() => {
     const el = box.current;
     if (!el) return;
-    const chart = init(el, { timezone: "Asia/Kolkata", styles: STYLES });
+    const chart = init(el, { timezone: "Asia/Kolkata", styles: STYLES, customApi: { formatDate: fmtDate } });
     chart?.setPriceVolumePrecision(2, 0);
     chartRef.current = chart;
     return () => {
@@ -522,6 +632,58 @@ export function KlineChart({
       setReady(false);
     };
   }, []);
+
+  // The box's own height, which only "fill" needs: in a grid cell the pane
+  // decides it, not this component. It also replaces the resize-on-expand
+  // effect — expanding changes the box, and so does a preset switch, a window
+  // resize and a sidebar collapse, none of which this component would hear about.
+  const [boxH, setBoxH] = useState(0);
+  const [boxW, setBoxW] = useState(0);
+  useEffect(() => {
+    const el = box.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      setBoxH(el.clientHeight);
+      setBoxW(el.clientWidth);
+      chartRef.current?.resize();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Level names are placed by pixel position, so anything that moves a price up
+  // or down the pane invalidates that placement. Zooming, panning and dragging
+  // the axis all do, and none of them re-render React — so without this the
+  // labels stayed where the LAST level-set change put them and collapsed into an
+  // unreadable stack as soon as the chart was touched.
+  //
+  // Coalesced to one frame: a zoom gesture fires these continuously, and the
+  // work behind the bump is a pickLabels pass plus a cheap signature compare
+  // that draws nothing when the chosen set has not actually changed.
+  const [relayout, setRelayout] = useState(0);
+  /** What the level group was last drawn from. Zoom and resize now fire the
+   *  levels effect continuously; this is what keeps that from meaning continuous
+   *  overlay rebuilds. */
+  const sigRef = useRef("");
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !ready) return;
+    let frame = 0;
+    const bump = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => { frame = 0; setRelayout((n) => n + 1); });
+    };
+    const types = [ActionType.OnZoom, ActionType.OnScroll, ActionType.OnVisibleRangeChange, ActionType.OnPaneDrag];
+    for (const t of types) chart.subscribeAction(t, bump);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      for (const t of types) chart.unsubscribeAction(t, bump);
+    };
+  }, [ready]);
+
+  // What an indicator sub-pane sizes off. 440 is the first-paint fallback in fill
+  // mode, before the observer has measured anything.
+  const paneH = height === "fill" ? boxH || 440 : height;
 
   // Applying a whole new dataset snaps the viewport back to the latest bar, so
   // it happens only when the series itself changed. A poll that extends the same
@@ -545,7 +707,7 @@ export function KlineChart({
       // lands, so the view settles on the latest bar with the new spacing — and
       // only on a new series, so a poll never overrides the zoom the user set.
       const width = chart.getSize("candle_pane", DomPosition.Main)?.width ?? 0;
-      if (width > 0) chart.setBarSpace(Math.min(40, Math.max(2, width / (bars.length + 4))));
+      if (width > 0) chart.setBarSpace(openBarSpace(width, bars.length, intraday));
       chart.applyNewData(bars);
       appliedRef.current = key;
     } else {
@@ -574,23 +736,86 @@ export function KlineChart({
       if (want && !paneId) {
         const id = i.pane == null
           ? chart.createIndicator(i.key, true, { id: "candle_pane" })
-          : chart.createIndicator(i.key, false, { id: i.pane, height: Math.round(height * 0.22) });
+          : chart.createIndicator(i.key, false, { id: i.pane, height: Math.round(paneH * 0.22) });
         if (id) panesRef.current[i.key] = id;
       } else if (!want && paneId) {
         chart.removeIndicator(paneId, i.key);
         delete panesRef.current[i.key];
       }
     }
-  }, [ind, hasVol, height]);
+  }, [ind, hasVol, paneH]);
 
-  // Levels and zones (T7), redrawn as one locked group. A crossed level is drawn
-  // BROKEN — dashed, dimmed and labelled so — never quietly relabelled. KIND_COLOR
-  // is imported from the ladder so the two cannot drift apart on colour.
+  // Levels and zones (T7), redrawn as one locked group. KIND_COLOR is imported
+  // from the ladder so the two cannot drift apart on colour.
+  //
+  // Weight is the whole point of this pass. Twelve levels is the ordinary count,
+  // and every one of them used to be drawn dashed, at full saturation, up to 3px
+  // thick, across the entire pane — so the reference grid shouted louder than the
+  // price it was there to describe. They are now hairlines at partial opacity:
+  // present when looked for, silent otherwise, which is how a professional chart
+  // carries its levels.
+  //
+  // It also means BROKEN finally looks different. Everything was dashed before,
+  // so the one distinction that matters — this level failed — was carried by
+  // opacity alone. Intact is solid now; dashed means broken, nothing else.
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart || !ready) return;
+    if (!showLevels) {
+      chart.removeOverlay({ groupId: "levels" });
+      sigRef.current = "";
+      return;
+    }
+
+    // Which levels get their name written on them — see lib/chart-layout.
+    //
+    // Re-run on every zoom, pan, axis drag and resize (via `relayout`/`boxH`),
+    // because all of those move a price up or down the pane and a name placed
+    // for the old geometry is a name in the wrong place. It is cheap: the pass
+    // below is N convertToPixel calls, and the signature guard means a gesture
+    // that does not change WHICH names fit draws nothing at all.
+    const yOf = (value: number): number | null => {
+      try {
+        const c = chart.convertToPixel({ value }, { paneId: "candle_pane" }) as { y?: number };
+        return typeof c?.y === "number" && Number.isFinite(c.y) ? c.y : null;
+      } catch { return null; }
+    };
+    // Reserved: the OHLC legend's own band at the top left, which is where the
+    // labels also live — a level near the top of the range used to print its name
+    // straight through "O 24,570.20 H 24,624.65" — and SPOT, which is not one of
+    // `levels` and always draws, so it claims its space before the contest rather
+    // than being written over by whichever level sits a few points from price.
+    //
+    // Spot is READ FROM A REF, not depended on: it moves with the tape, and a
+    // dependency here is what made every tick rebuild all ~19 level overlays.
+    // The cost is that thinning is decided against spot as it stood when the
+    // level set last changed, so after a long drift a name can end up a few
+    // pixels from the SPOT chip — the same staleness pickLabels already accepts
+    // for the y-axis.
+    const s = spotRef.current;
+    const spotY = s != null && Number.isFinite(s) ? yOf(s) : null;
+    const labelled = pickLabels(
+      levels.filter((l) => !hidden.has(l.label))
+        .map((l) => ({ label: l.label, strength: l.strength, y: yOf(l.price) })),
+      spotY == null ? [LEGEND_Y] : [LEGEND_Y, spotY],
+    );
+
+    // How wide a name may be, at this pane's width. A split pane is not a
+    // narrower version of a full one — the same compound label that reads fine
+    // at 1400px overran the canvas at 480 and was clipped mid-word.
+    const budget = labelBudget(boxW || 900);
+
+    // Everything that decides what gets DRAWN, in one string. A zoom or a resize
+    // that leaves the same names in the same fitted form is a no-op here, so the
+    // overlay churn this run removed does not come back through the new triggers.
+    const sig = JSON.stringify([
+      symbol, res, budget, [...labelled].sort(),
+      levels.filter((l) => !hidden.has(l.label)).map((l) => [l.label, l.price, l.crossed, l.strength, l.lo, l.hi]),
+    ]);
+    if (sig === sigRef.current) return;
+    sigRef.current = sig;
+
     chart.removeOverlay({ groupId: "levels" });
-    if (!showLevels) return;
     const items: OverlayCreate[] = [];
     for (const l of levels) {
       if (hidden.has(l.label)) continue;
@@ -600,32 +825,64 @@ export function KlineChart({
         items.push({
           name: "zoneBand", groupId: "levels", lock: true,
           points: [{ value: l.hi }, { value: l.lo }],
-          styles: { rect: { style: PolygonType.Fill, color: fade(color, broken ? 0.08 : 0.2), borderSize: 0, borderColor: "transparent" } },
+          styles: { rect: { style: PolygonType.Fill, color: fade(color, broken ? 0.06 : 0.14), borderSize: 0, borderColor: "transparent" } },
         });
       }
       items.push({
         name: "levelTag", groupId: "levels", lock: true,
         points: [{ value: l.price }],
-        extendData: broken ? `${l.label} · BROKEN` : l.label,
+        extendData: {
+          text: shortLevelLabel(l.label, budget, broken),
+          label: labelled.has(l.label),
+        } satisfies TagData,
         styles: {
           line: {
-            color: broken ? fade(color, 0.5) : color,
-            style: LineType.Dashed,
-            size: Math.min(3, 1 + Math.round((l.strength ?? 0) / 40)),
+            // A strong level earns opacity, not thickness. Every line is 1px.
+            color: fade(color, broken ? 0.34 : 0.4 + Math.min(0.32, (l.strength ?? 0) / 300)),
+            style: broken ? LineType.Dashed : LineType.Solid,
+            dashedValue: [4, 4],
+            size: 1,
           },
-          text: { color: C.void, backgroundColor: broken ? fade(color, 0.5) : color, size: 10 },
+          // Coloured text on the pane's own background, not white-on-saturated:
+          // a chip per level is what made the old axis a wall of colour.
+          text: {
+            color: broken ? fade(color, 0.75) : color,
+            backgroundColor: fade(C.void, 0.72),
+            size: 11, paddingLeft: 4, paddingRight: 4, paddingTop: 1, paddingBottom: 1, borderRadius: 3,
+          },
         },
       });
     }
-    if (spot != null && Number.isFinite(spot)) {
-      items.push({
-        name: "levelTag", groupId: "levels", lock: true, points: [{ value: spot }],
-        extendData: "SPOT",
-        styles: { line: { color: C.accent, style: LineType.Solid, size: 2 }, text: { color: C.void, backgroundColor: C.accent, size: 10 } },
-      });
-    }
     if (items.length) chart.createOverlay(items);
-  }, [levels, spot, ready, showLevels, hidden]);
+  }, [levels, ready, showLevels, hidden, scale, res, symbol, relayout, boxH, boxW]);
+
+  // SPOT, in a group of its own — it is the one line here that moves with the
+  // tape. Drawn with the levels it shared their fate: every tick destroyed and
+  // recreated all ~19 level overlays, each with a convertToPixel, several times a
+  // second. One overlay per tick instead.
+  //
+  // No price-scale chip: the chart folds live ticks into its last bar, so the
+  // library's own last-price mark already sits at this exact height and the two
+  // tags landed on top of each other, each clipping the other. The scale keeps one
+  // price marker; SPOT keeps the full-width line, which is the part that is
+  // actually worth having.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !ready) return;
+    chart.removeOverlay({ groupId: "spot" });
+    if (!showLevels || spot == null || !Number.isFinite(spot)) return;
+    chart.createOverlay({
+      name: "levelTag", groupId: "spot", lock: true, points: [{ value: spot }],
+      extendData: { text: "SPOT" } satisfies TagData,
+      styles: {
+        line: { color: C.accent, style: LineType.Solid, size: 1 },
+        text: {
+          color: C.void, backgroundColor: C.accent, size: 11,
+          paddingLeft: 5, paddingRight: 5, paddingTop: 1, paddingBottom: 1, borderRadius: 3,
+        },
+      },
+    });
+  }, [spot, ready, showLevels]);
 
   // Live ticks folded into the last bar. Volume is not on the tape, so a bar
   // opened here carries 0 — the poll replaces it with the exchange's own bar.
@@ -641,12 +898,25 @@ export function KlineChart({
       if (!bar) return;
       lastRef.current = bar;
       chart.updateData(bar);
-      setStreaming(true);
+      setLastTickAt(Date.now());
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveKey, spec.minutes]);
 
-  useEffect(() => { setStreaming(false); }, [symbol, res]);
+  useEffect(() => { setLastTickAt(null); }, [symbol, res]);
+
+  // Liveness is the age of the last tick, not a flag the first one latched: the
+  // tape stops at 15:30 and nothing arrives to switch a flag back off. Sampling
+  // the clock is what makes the claim expire on its own; 5s is well inside the
+  // 15s window, and one timer per chart is cheaper than a shared clock's
+  // bookkeeping.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (!liveKey) return;
+    const id = setInterval(() => setClock(Date.now()), 5_000);
+    return () => clearInterval(id);
+  }, [liveKey]);
+  const streaming = isStreaming(lastTickAt, clock);
 
   // ---- drawing tools ------------------------------------------------------
 
@@ -660,13 +930,17 @@ export function KlineChart({
       .map((id) => chart.getOverlayById(id))
       .filter((o): o is NonNullable<typeof o> => o != null)
       .map((o) => toSaved(o.name, o.points, o.styles ?? undefined));
-    if (saved.length) writeJson(drawKey(symbol), saved);
-    else removeStored(drawKey(symbol));
+    // Through the store's wrapper, not writeJson: another chart on this symbol
+    // has to hear about the write or it keeps a stale set and overwrites this
+    // one on its next save.
+    if (saved.length) writeDrawings(symbol, saved, readoutId);
+    else clearDrawings(symbol, readoutId);
   };
 
   const track = (name: string) => ({
     onDrawEnd: (e: { overlay: { id: string } }) => {
       drawnRef.current.push(e.overlay.id);
+      pendingRef.current = null;          // finished — no longer cancellable
       setTool(null);
       saveDrawings();
       return false;
@@ -684,19 +958,38 @@ export function KlineChart({
   const startTool = (name: string) => {
     const chart = chartRef.current;
     if (!chart) return;
+    // Arming a second tool abandons the first one's overlay — it carries no
+    // points and no id on the undo stack, so nothing else would ever remove it.
+    if (pendingRef.current) chart.removeOverlay(pendingRef.current);
     setTool(name);
-    chart.createOverlay({
+    const id = chart.createOverlay({
       ...track(name), groupId: "draw",
       mode: magnet ? OverlayMode.WeakMagnet : OverlayMode.Normal,
     });
+    // The armed overlay exists from this moment, with no points on it yet and no
+    // id on the undo stack. Held so cancelling can remove exactly it.
+    pendingRef.current = typeof id === "string" ? id : null;
   };
 
+  // Changing your mind about an armed tool throws away the unfinished overlay and
+  // NOTHING else. This used to clear the whole "draw" group and the symbol's saved
+  // drawings, so Esc on an armed trendline deleted every trendline ever saved for
+  // NIFTY — unrecoverably, and now instantly in every other pane on that symbol
+  // too, since the write is broadcast. The bin below is the control that wipes.
   const cancelTool = () => {
-    // Removes the half-drawn overlay too — it is in the same group and has no id
-    // on the stack yet.
+    const id = pendingRef.current;
+    if (id) chartRef.current?.removeOverlay(id);
+    pendingRef.current = null;
+    setTool(null);
+  };
+
+  /** The bin: every drawing on this symbol, saved ones included. Deliberate,
+   *  labelled as such, and reachable from one button only. */
+  const clearAllDrawings = () => {
     chartRef.current?.removeOverlay({ groupId: "draw" });
     drawnRef.current = [];
-    removeStored(drawKey(symbol));
+    pendingRef.current = null;
+    clearDrawings(symbol, readoutId);
     setTool(null);
   };
 
@@ -709,6 +1002,7 @@ export function KlineChart({
   // Put the saved drawings back, once per symbol and only once there are bars to
   // anchor them against.
   const drawnFor = useRef("");
+  const [drawSeq, setDrawSeq] = useState(0);
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart || !ready || drawnFor.current === symbol) return;
@@ -724,7 +1018,17 @@ export function KlineChart({
       });
       if (typeof id === "string") drawnRef.current.push(id);
     }
-  }, [symbol, ready]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [symbol, ready, drawSeq]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Someone else drew on this symbol — another pane on this page, or another tab.
+  // Forget which symbol is drawn and the effect above recreates the group from
+  // storage; recreating it here as well is how the two copies would drift apart.
+  // Programmatic overlays fire no onDrawEnd, so this cannot loop back into a save.
+  useEffect(() => onDrawingsChanged(symbol, (token) => {
+    if (token === readoutId) return;        // our own write, already on screen
+    drawnFor.current = "";
+    setDrawSeq((n) => n + 1);
+  }), [symbol, readoutId]);
 
   // ---- keyboard cursor ----------------------------------------------------
 
@@ -777,7 +1081,7 @@ export function KlineChart({
     if (!chart) return;
     chart.setStyles({ yAxis: { type: Y_TYPE[scale] } });
     const width = chart.getSize("candle_pane", DomPosition.Main)?.width ?? 0;
-    if (width > 0 && bars.length) chart.setBarSpace(Math.min(40, Math.max(2, width / (bars.length + 4))));
+    if (width > 0 && bars.length) chart.setBarSpace(openBarSpace(width, bars.length, intraday));
     chart.scrollToRealTime();
     setCursor(null);
   };
@@ -801,15 +1105,12 @@ export function KlineChart({
     else if (k === "Escape") {
       // One key, unwound in the order a user expects to undo things.
       hit();
-      if (help || guide || picker) { setHelp(false); setGuide(false); setPicker(false); }
+      if (help || guide || picker || more) { setHelp(false); setGuide(false); setPicker(false); setMore(false); }
       else if (tool) cancelTool();
       else if (cursor != null) setCursor(null);
       else setExpanded(false);
     }
   };
-
-  // Expanding changes the box, and the library sizes to its container.
-  useEffect(() => { chartRef.current?.resize(); }, [expanded]);
 
   // ---- level filter -------------------------------------------------------
 
@@ -848,6 +1149,21 @@ export function KlineChart({
     ? "the intraday feed publishes no volume on index bars — switch to 1D, where it does"
     : "the exchange publishes no volume for this instrument";
 
+  // Coverage and every caveat that goes with it, as ONE string rather than four
+  // spans: compact mode has to be able to put it somewhere other than under the
+  // canvas, and a title attribute or a popover cannot take JSX. Laid out below
+  // the chart it reads exactly as it did as spans.
+  const notes = [
+    showEmpty ? "" : coverage,
+    !hasVol && bars.length > 0
+      ? `no volume drawn: ${noVolWhy}, and a fabricated one would be worse than none` : "",
+    ind.VWAP && !hasVol ? "VWAP needs volume, so it is not drawn here" : "",
+    (ind.VWAP || ind.TWAP) && !intraday
+      ? `on daily bars ${ind.VWAP && ind.TWAP ? "VWAP and TWAP are" : ind.VWAP ? "VWAP is" : "TWAP is"} anchored`
+        + " once to the first bar loaded, not re-anchored per session — a per-bar anchor would only redraw"
+        + " each bar's own typical price" : "",
+  ].filter(Boolean).join(" · ");
+
   // What the cursor bar says, in words. A price alone is not a reading — what
   // makes this chart worth looking at is the price against the level map, so the
   // nearest level and the distance to it are said out loud too. Announced to a
@@ -868,122 +1184,192 @@ export function KlineChart({
     `bar ${cursor! + 1} of ${bars.length}`,
   ].join(" · ");
 
+  // ---- toolbar ------------------------------------------------------------
+
+  // Every control, defined once and laid out twice. A 480px grid cell cannot take
+  // the three-row toolbar this chart was built with — it wraps to ~140px and eats
+  // a third of the pane — so `compact` folds everything but the resolution and the
+  // scale into an overflow menu. Same handlers, same state, same aria-pressed: a
+  // second implementation is a second thing to keep in step, and it would not stay.
+  const resPills = (
+    <Pills options={RESOLUTIONS.map((r) => ({ label: r.label, value: r.label }))} value={res} onChange={setRes} title="Resolution" />
+  );
+  const rangePills = !intraday && onTimeframe
+    ? <Pills options={RANGES.map((r) => ({ label: r, value: r }))} value={timeframe ?? "1Y"} onChange={onTimeframe} title="Daily range" />
+    : null;
+  const typePills = <Pills options={TYPES} value={type} onChange={setType} title="Series type" />;
+  const scaleToggles = (
+    <>
+      <Toggle on={scale === "log"} onClick={() => setScale((s) => (s === "log" ? "normal" : "log"))}>LOG</Toggle>
+      <Toggle on={scale === "percent"} onClick={() => setScale((s) => (s === "percent" ? "normal" : "percent"))}>%</Toggle>
+    </>
+  );
+  const indicatorToggles = INDICATORS.map((i) => {
+    const blocked = "needsVolume" in i && i.needsVolume && !hasVol;
+    return (
+      <Toggle key={i.key} on={ind[i.key] && !blocked} disabled={blocked}
+        title={blocked ? noVolWhy : undefined}
+        onClick={() => setInd((p) => ({ ...p, [i.key]: !p[i.key] }))}>
+        {i.label}
+      </Toggle>
+    );
+  });
+
+  // Drawing tools. A tool arms one overlay: click the chart to place its points,
+  // and the tool disarms itself when the drawing is finished.
+  const drawTools = (
+    <>
+      {TOOLS.map(({ name, label: tip, Icon }) => (
+        <button key={name} onClick={() => (tool === name ? cancelTool() : startTool(name))}
+          aria-pressed={tool === name} title={tip} aria-label={tip}
+          className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+            tool === name ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+          <Icon size={14} />
+        </button>
+      ))}
+      <span className="mx-1 h-4 w-px bg-line" />
+      <button onClick={() => setMagnet((m) => !m)} aria-pressed={magnet} title="Snap new points to the nearest OHLC value" aria-label="Snap new points to the nearest OHLC value"
+        className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+          magnet ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+        <Magnet size={14} />
+      </button>
+      <button onClick={undo} title="Remove the last drawing" aria-label="Remove the last drawing"
+        className="rounded-[7px] bg-void p-1.5 text-muted transition-colors hairline hover:text-mist">
+        <Undo2 size={14} />
+      </button>
+      <button onClick={clearAllDrawings} title="Remove every drawing, saved ones included" aria-label="Remove every drawing"
+        className="rounded-[7px] bg-void p-1.5 text-muted transition-colors hairline hover:text-mist">
+        <Trash2 size={14} />
+      </button>
+    </>
+  );
+
+  const drawHint = tool
+    ? "Click the chart to place the drawing's points."
+    : `Drawings and this setup are saved in this browser, per index — ${symbol} here.`;
+
+  // Liveness, in the two states it can honestly be in. No tick ever seen draws
+  // nothing at all — an empty claim is worse than none.
+  const streamPill = lastTickAt == null ? null : (
+    <span className="mr-1 inline-flex shrink-0 items-center gap-1.5 text-[10.5px] text-mist"
+      title={streaming ? "ticks are arriving now" : "the time of the last tick — the tape has gone quiet since"}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", streaming ? "bg-up" : "bg-faint")} />
+      {streaming ? "streaming" : label(lastTickAt)}
+    </span>
+  );
+
+  const panelButtons = (
+    <>
+      <button onClick={() => setShowLevels((v) => !v)} aria-pressed={showLevels}
+        title={`${showLevels ? "Hide" : "Show"} the level map on the chart (L)`}
+        aria-label={`${showLevels ? "Hide" : "Show"} the level map`}
+        className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+          showLevels ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+        {showLevels ? <Eye size={14} /> : <EyeOff size={14} />}
+      </button>
+      <button onClick={() => { setPicker((v) => !v); setGuide(false); setHelp(false); }} aria-pressed={picker}
+        title="Pick which levels are drawn (S)" aria-label="Pick which levels are drawn"
+        className={cn("relative rounded-[7px] p-1.5 transition-colors hairline",
+          picker ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+        <SlidersHorizontal size={14} />
+        {hidden.size > 0 && (
+          <span className="absolute -right-0.5 -top-0.5 rounded-full bg-accent px-1 text-[8px] font-semibold text-void tnum">
+            {shown.length}
+          </span>
+        )}
+      </button>
+      <button onClick={() => { setGuide((v) => !v); setPicker(false); setHelp(false); }} aria-pressed={guide}
+        title="What the indicators mean (I)" aria-label="What the indicators mean"
+        className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+          guide ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+        <BookOpen size={14} />
+      </button>
+      <button onClick={() => setHelp((v) => !v)} aria-pressed={help}
+        title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts"
+        className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+          help ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+        <Keyboard size={14} />
+      </button>
+      <button onClick={() => setExpanded((v) => !v)} aria-pressed={expanded}
+        title={`${expanded ? "Collapse" : "Expand"} the chart (F)`}
+        aria-label={`${expanded ? "Collapse" : "Expand"} the chart`}
+        className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+          expanded ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+        {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+      </button>
+    </>
+  );
+
   return (
-    <div className={cn("space-y-2.5", expanded && "fixed inset-0 z-50 overflow-auto bg-void p-4")}>
+    <div className={cn("space-y-2.5",
+      // Fill mode: the cell owns the height, so the chrome takes what it needs
+      // and the canvas below takes the rest.
+      height === "fill" && "flex h-full min-h-0 flex-col gap-2.5 space-y-0",
+      // Every row of chrome in a pane is a row the candles do not get (R42).
+      height === "fill" && compact && "gap-1.5",
+      expanded && "fixed inset-0 z-50 overflow-auto bg-void p-4")}>
       {expanded && (
         <div className="flex items-baseline gap-2">
           <h2 className="text-[13px] font-semibold text-frost">{symbol} · {res}</h2>
           <span className="text-[11px] text-faint">Esc or F to collapse</span>
         </div>
       )}
-      <div className="flex flex-wrap items-center gap-2">
-        <Pills options={RESOLUTIONS.map((r) => ({ label: r.label, value: r.label }))} value={res} onChange={setRes} title="Resolution" />
-        {!intraday && onTimeframe && (
-          <Pills options={RANGES.map((r) => ({ label: r, value: r }))} value={timeframe ?? "1Y"} onChange={onTimeframe} title="Daily range" />
-        )}
-        <Pills options={TYPES} value={type} onChange={setType} title="Series type" />
-        <div className="inline-flex items-center gap-1">
-          <Toggle on={scale === "log"} onClick={() => setScale((s) => (s === "log" ? "normal" : "log"))}>LOG</Toggle>
-          <Toggle on={scale === "percent"} onClick={() => setScale((s) => (s === "percent" ? "normal" : "percent"))}>%</Toggle>
-        </div>
-        <div className="ml-auto inline-flex flex-wrap items-center gap-1">
-          {INDICATORS.map((i) => {
-            const blocked = "needsVolume" in i && i.needsVolume && !hasVol;
-            return (
-              <Toggle key={i.key} on={ind[i.key] && !blocked} disabled={blocked}
-                title={blocked ? noVolWhy : undefined}
-                onClick={() => setInd((p) => ({ ...p, [i.key]: !p[i.key] }))}>
-                {i.label}
-              </Toggle>
-            );
-          })}
-        </div>
-      </div>
 
-      {/* Drawing tools. A tool arms one overlay: click the chart to place its
-          points, and the tool disarms itself when the drawing is finished. */}
-      <div className="flex flex-wrap items-center gap-1">
-        {TOOLS.map(({ name, label: tip, Icon }) => (
-          <button key={name} onClick={() => (tool === name ? cancelTool() : startTool(name))}
-            aria-pressed={tool === name} title={tip} aria-label={tip}
-            className={cn("rounded-[7px] p-1.5 transition-colors hairline",
-              tool === name ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-            <Icon size={14} />
-          </button>
-        ))}
-        <span className="mx-1 h-4 w-px bg-line" />
-        <button onClick={() => setMagnet((m) => !m)} aria-pressed={magnet} title="Snap new points to the nearest OHLC value" aria-label="Snap new points to the nearest OHLC value"
-          className={cn("rounded-[7px] p-1.5 transition-colors hairline",
-            magnet ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-          <Magnet size={14} />
-        </button>
-        <button onClick={undo} title="Remove the last drawing" aria-label="Remove the last drawing"
-          className="rounded-[7px] bg-void p-1.5 text-muted transition-colors hairline hover:text-mist">
-          <Undo2 size={14} />
-        </button>
-        <button onClick={cancelTool} title="Remove every drawing, saved ones included" aria-label="Remove every drawing"
-          className="rounded-[7px] bg-void p-1.5 text-muted transition-colors hairline hover:text-mist">
-          <Trash2 size={14} />
-        </button>
-        <span className="ml-2 text-[10.5px] text-faint">
-          {tool ? "Click the chart to place the drawing's points." : `Drawings and this setup are saved in this browser, per index — ${symbol} here.`}
-        </span>
-
-        <div className="ml-auto inline-flex items-center gap-1">
-          {streaming && (
-            <span className="mr-1 inline-flex items-center gap-1.5 text-[10.5px] text-mist">
-              <span className="h-1.5 w-1.5 rounded-full bg-up" /> streaming
-            </span>
-          )}
-          <button onClick={() => setShowLevels((v) => !v)} aria-pressed={showLevels}
-            title={`${showLevels ? "Hide" : "Show"} the level map on the chart (L)`}
-            aria-label={`${showLevels ? "Hide" : "Show"} the level map`}
-            className={cn("rounded-[7px] p-1.5 transition-colors hairline",
-              showLevels ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-            {showLevels ? <Eye size={14} /> : <EyeOff size={14} />}
-          </button>
-          <button onClick={() => { setPicker((v) => !v); setGuide(false); setHelp(false); }} aria-pressed={picker}
-            title="Pick which levels are drawn (S)" aria-label="Pick which levels are drawn"
-            className={cn("relative rounded-[7px] p-1.5 transition-colors hairline",
-              picker ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-            <SlidersHorizontal size={14} />
-            {hidden.size > 0 && (
-              <span className="absolute -right-0.5 -top-0.5 rounded-full bg-accent px-1 text-[8px] font-semibold text-void tnum">
-                {shown.length}
-              </span>
-            )}
-          </button>
-          <button onClick={() => { setGuide((v) => !v); setPicker(false); setHelp(false); }} aria-pressed={guide}
-            title="What the indicators mean (I)" aria-label="What the indicators mean"
-            className={cn("rounded-[7px] p-1.5 transition-colors hairline",
-              guide ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-            <BookOpen size={14} />
-          </button>
-          <button onClick={() => setHelp((v) => !v)} aria-pressed={help}
-            title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts"
-            className={cn("rounded-[7px] p-1.5 transition-colors hairline",
-              help ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-            <Keyboard size={14} />
-          </button>
-          <button onClick={() => setExpanded((v) => !v)} aria-pressed={expanded}
-            title={`${expanded ? "Collapse" : "Expand"} the chart (F)`}
-            aria-label={`${expanded ? "Collapse" : "Expand"} the chart`}
-            className={cn("rounded-[7px] p-1.5 transition-colors hairline",
-              expanded ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
-            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-          </button>
+      {compact ? (
+        <div className="flex items-center gap-1">
+          {resPills}
+          <div className="inline-flex items-center gap-1">{scaleToggles}</div>
+          <div className="ml-auto inline-flex items-center gap-1">
+            {streamPill}
+            <div className="relative">
+              <button onClick={() => setMore((v) => !v)} aria-pressed={more}
+                title="Everything else on this chart" aria-label="Everything else on this chart"
+                className={cn("rounded-[7px] p-1.5 transition-colors hairline",
+                  more ? "bg-raised text-accent" : "bg-void text-muted hover:text-mist")}>
+                <MoreHorizontal size={14} />
+              </button>
+              {more && (
+                <div className="absolute right-0 top-full z-20 mt-1 w-[296px] rounded-[var(--radius-sm)] bg-raised p-2 shadow-lg hairline">
+                  <div className="flex flex-wrap items-center gap-1">{rangePills}{typePills}</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1">{indicatorToggles}</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1">{drawTools}</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1">{panelButtons}</div>
+                  <p className="mt-1.5 text-[10.5px] leading-snug text-faint">{drawHint}</p>
+                  {/* What the pane below has no room to print: which bars these
+                      are, over what window, and what is missing from them. */}
+                  {notes && <p className="mt-1.5 border-t border-line pt-1.5 text-[10.5px] leading-snug text-faint">{notes}</p>}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
-      </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            {resPills}
+            {rangePills}
+            {typePills}
+            <div className="inline-flex items-center gap-1">{scaleToggles}</div>
+            <div className="ml-auto inline-flex flex-wrap items-center gap-1">{indicatorToggles}</div>
+          </div>
+          <div className="flex flex-wrap items-center gap-1">
+            {drawTools}
+            <span className="ml-2 text-[10.5px] text-faint">{drawHint}</span>
+            <div className="ml-auto inline-flex items-center gap-1">{streamPill}{panelButtons}</div>
+          </div>
+        </>
+      )}
 
       {/* The canvas itself: reachable by Tab, driven by the keys in KEYS, and
           labelled so a screen reader announces what it is before the cursor
           starts reading bars out of it. */}
-      <div className="relative w-full outline-none focus-visible:ring-2 focus-visible:ring-accent/70"
-        style={{ height: expanded ? "calc(100vh - 230px)" : height }}
+      <div className={cn("relative w-full outline-none focus-visible:ring-2 focus-visible:ring-accent/70",
+        height === "fill" && !expanded && "min-h-0 flex-1")}
+        style={{ height: expanded ? "calc(100vh - 230px)" : height === "fill" ? undefined : height }}
         tabIndex={0} role="application" onKeyDown={onKeyDown}
         aria-label={`${symbol} ${res} price chart, ${bars.length} bars. `
           + `Use the arrow keys to read bar by bar, question mark for the shortcuts.`}
-        aria-describedby="chart-readout">
+        aria-describedby={readoutId}>
         {/* The library owns this node's children — nothing of React's goes in it. */}
         <div ref={box} className="absolute inset-0" />
         {showEmpty && (
@@ -1104,23 +1490,24 @@ export function KlineChart({
       </div>
 
       {/* One string, two audiences: shown to everyone, announced to a screen
-          reader. The chart is a canvas — without this it reads as nothing. */}
-      <p id="chart-readout" aria-live="polite" aria-atomic="true"
-        className={cn("text-[11.5px] leading-snug tnum", readout ? "text-mist" : "text-faint")}>
-        {readout ?? (bars.length ? "Click the chart or press Tab, then use the arrow keys to read it bar by bar." : "")}
+          reader. The chart is a canvas — without this it reads as nothing.
+          In a pane it is capped at one line with the rest in the title: four
+          wrapped lines of prose under a 336px cell is the canvas's height, and
+          the canvas is what the cell is for (R42). Never hidden — a keyboard
+          user reading bar by bar reads it here. */}
+      <p id={readoutId} aria-live="polite" aria-atomic="true"
+        title={compact ? readout ?? undefined : undefined}
+        className={cn("text-[11.5px] leading-snug tnum", compact && "truncate text-[11px]",
+          readout ? "text-mist" : "text-faint")}>
+        {readout ?? (bars.length
+          ? compact ? "Arrow keys read this chart bar by bar."
+            : "Click the chart or press Tab, then use the arrow keys to read it bar by bar."
+          : "")}
       </p>
 
-      <p className="text-[11px] leading-snug text-faint">
-        {!showEmpty && <span>{coverage}</span>}
-        {!hasVol && bars.length > 0 && (
-          <span>{!showEmpty && " · "}no volume drawn: {noVolWhy}, and a fabricated one would be worse than none</span>
-        )}
-        {ind.VWAP && !hasVol && <span> · VWAP needs volume, so it is not drawn here</span>}
-        {(ind.VWAP || ind.TWAP) && !intraday && (
-          <span> · on daily bars {ind.VWAP && ind.TWAP ? "VWAP and TWAP are" : ind.VWAP ? "VWAP is" : "TWAP is"} anchored
-            once to the first bar loaded, not re-anchored per session — a per-bar anchor would only redraw each bar&apos;s own typical price</span>
-        )}
-      </p>
+      {/* Coverage and its caveats. Compact hands them to the ⋯ menu instead of
+          spending four lines of a grid cell on them — reachable, not deleted. */}
+      {!compact && notes && <p className="text-[11px] leading-snug text-faint">{notes}</p>}
     </div>
   );
 }

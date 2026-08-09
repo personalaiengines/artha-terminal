@@ -1,11 +1,13 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Briefcase, PlugZap } from "lucide-react";
 import { Card, CardHeader, CardBody } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/primitives";
 import { POLL } from "@/lib/poll";
+import { useLivePrices } from "@/lib/use-live-prices";
+import { applyLiveTicks } from "@/lib/live-book";
 import { num, signed, trendClass } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -16,11 +18,22 @@ import { cn } from "@/lib/utils";
 export type Position = {
   symbol: string; qty: number; side: string;
   avg: number; ltp: number; pnl: number;
+  realized?: number | null; unrealized?: number | null;
   product: string; exchange: string;
+  /** Upstox instrument key, for the tick stream. Absent on older payloads. */
+  key?: string | null;
+  /** Contract size per unit of qty; 1 on every Indian F&O contract today. */
+  multiplier?: number | null;
+  /** True once a websocket tick has replaced this row's REST snapshot. */
+  isLive?: boolean;
 };
 export type PositionBook = {
   ok: boolean; status?: string; message?: string;
   items: Position[]; closed?: number;
+  // Contracts squared off today (net qty 0). Not open positions, so the panel
+  // only counts them — but their P&L is booked, which is what the tracker reads.
+  closedItems?: Position[];
+  realized?: number | null; unrealized?: number | null; net?: number | null;
 };
 
 /** `NIFTY26AUG24400CE` -> 24400. null when the contract name carries no strike. */
@@ -41,16 +54,28 @@ export function usePositions(): PositionBook | null {
         .then((r) => r.json())
         .then((j) => {
           if (!alive || !j) return;
-          setBook({ ok: !!j.ok, status: j.status, message: j.message, items: j.items ?? [], closed: j.closed ?? 0 });
+          setBook({
+            ok: !!j.ok, status: j.status, message: j.message,
+            items: j.items ?? [], closed: j.closed ?? 0, closedItems: j.closedItems ?? [],
+            realized: j.realized ?? null, unrealized: j.unrealized ?? null, net: j.net ?? null,
+          });
         })
         .catch(() => {
           if (alive) setBook({ ok: false, status: "unreachable", message: "Could not reach the positions service.", items: [] });
         });
     load();
-    const id = setInterval(load, POLL.holdings);
+    const id = setInterval(load, POLL.positions);
     return () => { alive = false; clearInterval(id); };
   }, []);
-  return book;
+
+  // The REST book is a snapshot up to 30s old (server cache) on top of a 30s
+  // poll, so an open contract's LTP and P&L sat visibly frozen while the index
+  // tape above them ticked. Overlay the tick stream, same as every equity list
+  // in the app already does — `key` is the Upstox instrument key, which the WS
+  // client passes through unresolved because it contains a "|". The arithmetic
+  // lives in lib/live-book.ts, where it can be tested.
+  const live = useLivePrices(book?.items?.map((p) => p.key ?? "").filter(Boolean) ?? []);
+  return useMemo(() => applyLiveTicks(book, live), [book, live]);
 }
 
 export function PositionsPanel({ book }: { book: PositionBook | null }) {
@@ -115,7 +140,10 @@ export function PositionsPanel({ book }: { book: PositionBook | null }) {
                     </td>
                     <td className="px-3 py-2 text-right text-mist">{p.qty}</td>
                     <td className="px-3 py-2 text-right text-mist">{num(p.avg)}</td>
-                    <td className="px-3 py-2 text-right text-mist">{num(p.ltp)}</td>
+                    {/* A live LTP is brighter than a polled one — the two are
+                        otherwise indistinguishable, and the difference is up to
+                        a minute of premium on an option. */}
+                    <td className={cn("px-3 py-2 text-right", p.isLive ? "text-frost" : "text-mist")}>{num(p.ltp)}</td>
                     <td className={cn("px-3 py-2 text-right font-semibold", trendClass(p.pnl))}>{signed(p.pnl)}</td>
                   </tr>
                 ))}

@@ -3,6 +3,7 @@ import { Layers } from "lucide-react";
 import { Card, CardHeader, CardBody } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { HealthBar } from "@/components/ui/stat";
+import type { Level } from "@/components/ui/candles";
 import { num, pct, trendClass } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -16,6 +17,7 @@ import { cn } from "@/lib/utils";
 export type ZoneMember = { label: string; price: number; kind: string; crossed: boolean };
 export type Zone = {
   price: number; lo: number; hi: number;
+  label: string;          // the members' labels, joined by the engine
   members: ZoneMember[];
   kind: string; crossed: boolean;
   state: string;          // "INTACT" | "AT PRICE" | "BROKEN" — rendered as-is
@@ -41,6 +43,18 @@ const SIGNAL_TONE = { HOLD: "neutral", WATCH: "accent", REVIEW: "warn" } as cons
 const STATE_TONE = { INTACT: "neutral", "AT PRICE": "accent", BROKEN: "warn" } as const;
 
 const color = (kind: string) => KIND_COLOR[kind] ?? "#f5a623";
+
+/** The chart's line list for a set of confluence zones. It lives beside
+ *  KIND_COLOR because that is the point: one colour table and one mapping, so a
+ *  zone drawn on a chart and the same zone in this ladder cannot disagree about
+ *  what it is or what colour it is (R18). `basis` travels verbatim. */
+export const zonesToLevels = (zones: Zone[]): Level[] =>
+  zones.map((z) => ({
+    price: z.price, lo: z.lo, hi: z.hi,
+    label: z.label,
+    color: color(z.kind),
+    kind: z.kind, crossed: z.crossed, strength: z.strength, basis: z.basis, state: z.state,
+  }));
 
 export function LevelLadder({
   zones, spot, structure, markers = [],

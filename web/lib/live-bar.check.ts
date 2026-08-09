@@ -5,7 +5,7 @@
 //
 // Prints "live-bar OK" and exits 0, or throws.
 
-import { foldTick, inSession, istDate, tickTime, type Bar } from "./live-bar";
+import { foldTick, inSession, isStreaming, istDate, tickTime, type Bar } from "./live-bar";
 
 const ok = (cond: boolean, msg: string) => { if (!cond) throw new Error(msg); };
 
@@ -63,5 +63,12 @@ ok(foldTick(d, 104, Date.parse("2026-07-31T11:00:00Z"), 0)!.close === 104,
 ok(tickTime(t0 + 5000, t0) === t0 + 5000, "a sane ltt is used as-is");
 ok(tickTime(undefined, t0) === t0, "no ltt falls back to now");
 ok(tickTime(1, t0) === t0, "an ltt a decade off is ignored, not drawn");
+
+// --- "streaming" is recency, never a latch ----------------------------------
+ok(!isStreaming(null, t0), "a chart that never saw a tick is not streaming");
+ok(isStreaming(t0 - 14_000, t0), "a tick 14s ago is still live");
+ok(!isStreaming(t0 - 16_000, t0), "a tick 16s ago is stale — the claim must expire on its own");
+ok(isStreaming(t0 + 500, t0), "a clock sampled just before the tick still reads live");
+ok(isStreaming(t0 - 30_000, t0, 60_000), "the window is the caller's to widen");
 
 console.log("live-bar OK");

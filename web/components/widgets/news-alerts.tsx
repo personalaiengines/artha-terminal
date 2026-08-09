@@ -159,7 +159,8 @@ export function NewsAlerts() {
                       {a.headline}
                     </p>
                     <p className="mt-0.5 text-[11px] text-muted">
-                      {a.source} · {a.region === "global" ? "International" : "India"} · {timeAgo(a.time)}
+                      {[a.source, a.region === "global" ? "International" : "India", timeAgo(a.time)]
+                        .filter(Boolean).join(" · ")}
                     </p>
                   </div>
                   <span className="shrink-0 text-[11px] text-accent">View</span>

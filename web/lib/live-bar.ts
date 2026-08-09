@@ -25,6 +25,18 @@ export const inSession = (ms: number) => {
   return m >= OPEN_MIN && m <= CLOSE_MIN;
 };
 
+/** Whether a chart may still claim it is streaming.
+ *
+ *  The status used to be a boolean latched true by the first tick and reset only
+ *  on a symbol or resolution change, so at 15:31 every chart on the page went on
+ *  claiming a live tape all night. Recency is the only honest answer: inside the
+ *  window it is streaming, outside it the caller shows when the last tick landed.
+ *
+ *  A `lastTickAt` ahead of `now` reads as live — the clock driving this is
+ *  sampled, so it can lag a tick by a few seconds. */
+export const isStreaming = (lastTickAt: number | null, now: number, windowMs = 15_000): boolean =>
+  lastTickAt != null && now - lastTickAt <= windowMs;
+
 /** The exchange's own timestamp for a tick when it carries one (`ltt`), else the
  *  browser clock. A clock that disagrees with the tape by more than a day is not
  *  a timestamp worth trusting, so it is ignored rather than drawn. */

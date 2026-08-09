@@ -140,7 +140,7 @@ export type SessionPhase = "pre_open" | "open" | "post_close";
 export type Holding = { symbol: string; qty: number; avg: number; };
 
 export type EconEvent = {
-  date: string; time: string; title: string; country: string;
+  date: string; time: string; title: string; country: string; detail?: string;
   impact: "high" | "medium" | "low"; actual?: string; forecast?: string; prior?: string;
   url?: string;
 };

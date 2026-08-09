@@ -49,12 +49,19 @@ class MarketWs {
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg?.type === "tick") {
         // Handlers are registered under the caller's own name ("RELIANCE",
-        // "nifty50"), which is what the server echoes back as `symbol`.
-        // Matching on `key` alone missed every equity, whose key is its ISIN.
-        const h1 = this.tickHandlers.get(msg.symbol);
-        const h2 = msg.symbol === msg.key ? undefined : this.tickHandlers.get(msg.key);
-        h1?.forEach((h) => h(msg.tick));
-        h2?.forEach((h) => h(msg.tick));
+        // "nifty50"), which is what the server echoes back. Matching on `key`
+        // alone missed every equity, whose key is its ISIN.
+        //
+        // `symbols` is every alias the instrument is subscribed under, because
+        // two callers can name the same instrument differently and only one of
+        // them used to get ticks. Dedupe the handlers: a component that
+        // subscribed under two aliases must still be called once per tick.
+        const names: string[] = msg.symbols?.length ? msg.symbols : [msg.symbol];
+        const fire = new Set<TickHandler>();
+        for (const name of [...names, msg.key]) {
+          this.tickHandlers.get(name)?.forEach((h) => fire.add(h));
+        }
+        fire.forEach((h) => h(msg.tick));
       } else if (msg?.type) {
         this.topicHandlers.get(msg.type)?.forEach((h) => h(msg.payload));
       }

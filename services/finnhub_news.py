@@ -16,6 +16,7 @@ not a replacement.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import httpx
 
@@ -53,5 +54,20 @@ def get_finnhub_general_news(limit: int = 20) -> list[dict]:
             "link": url,
             "snippet": (item.get("summary") or "").strip(),
             "source": "finnhub",
+            "published": _published(item.get("datetime")),
         })
     return out
+
+
+def _published(ts) -> str | None:
+    """Finnhub's `datetime` (unix seconds, UTC) as an ISO-8601 string.
+
+    It was on every item and being thrown away, so the feed had no way to tell a
+    two-hour-old wire story from a nine-year-old one.
+    """
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None

@@ -51,7 +51,14 @@ export function NewsCard({ item, featured = false }: { item: NewsItem; featured?
           <span key={t} className="rounded-md bg-raised px-1.5 py-0.5 text-[10.5px] font-medium text-mist tnum">{t}</span>
         ))}
         <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[11px] text-faint">
-          {item.time && <span>{timeAgo(item.time)}</span>}
+          {/* The article's own publication time. `title` carries the exact
+              local timestamp, because "6h ago" is the wrong unit for deciding
+              whether a story predates the session you are trading. */}
+          {timeAgo(item.time) && (
+            <time dateTime={item.time} title={new Date(item.time).toLocaleString("en-IN")}>
+              {timeAgo(item.time)}
+            </time>
+          )}
           {item.url && (
             <span className="flex items-center gap-0.5 text-muted group-hover:text-accent">
               <ExternalLink size={11} />Read
