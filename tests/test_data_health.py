@@ -150,7 +150,12 @@ def test_errors_sort_ahead_of_warnings(monkeypatch):
                                  "detail": "", "last_good": None, "fix": None})
     monkeypatch.setattr(dh, "_check_upstox", lambda: None)
     monkeypatch.setattr(dh, "_check_market_feed", lambda: None)
+    # Both list-returning checks must be stubbed, not just the jobs one:
+    # _check_stale_feeds reads the real last_good table, so a feed that happens
+    # to be stale when the suite runs injects an extra warn and fails this
+    # assertion. Observed in the container with pulse 2h stale.
     monkeypatch.setattr(dh, "_check_ingestion_jobs", list)
+    monkeypatch.setattr(dh, "_check_stale_feeds", list)
 
     out = dh.get_data_health()
     assert out["live"] is False
@@ -161,6 +166,7 @@ def test_a_healthy_system_reports_live(monkeypatch):
     for name in ("_check_index_members", "_check_prices", "_check_upstox", "_check_market_feed"):
         monkeypatch.setattr(dh, name, lambda: None)
     monkeypatch.setattr(dh, "_check_ingestion_jobs", list)
+    monkeypatch.setattr(dh, "_check_stale_feeds", list)
 
     out = dh.get_data_health()
     assert out["live"] is True and out["issues"] == []

@@ -491,6 +491,11 @@ def level_zones(spot: float, levels: list[dict], tol_pct: float = ZONE_TOL_PCT, 
         dist = (price - spot) / spot * 100
         zones.append({
             "price": round(price, 1),
+            # The zone's name: its members', joined. Emitted HERE because three
+            # separate readers (structure_state, the ladder, the chart) each
+            # rebuilt this join from `members`, and anything asking a zone for
+            # its own label got nothing back.
+            "label": " + ".join(m["label"] for m in g),
             "lo": round(min(prices), 1), "hi": round(max(prices), 1),
             "members": [dict(m) for m in g],
             "kind": kind,
@@ -529,16 +534,13 @@ def structure_state(spot: float, zones: list[dict], pivots: dict | None = None) 
                 "headline": "Level map unavailable — no levels were computed for this session.",
                 "basis": "no levels available to compare against spot."}
 
-    def labels(z: dict) -> str:
-        return " + ".join(m["label"] for m in z["members"])
-
     broken = [z for z in zones if z["crossed"]]
     if broken:
         return {
             "signal": "REVIEW",
             "headline": (f"{len(broken)} level{'s' if len(broken) > 1 else ''} flipped side "
                          f"since the prior session; the level map has changed."),
-            "basis": "; ".join(f"{labels(z)} {_px(z['price'])} {z['flip']}" for z in broken) + ".",
+            "basis": "; ".join(f"{z['label']} {_px(z['price'])} {z['flip']}" for z in broken) + ".",
         }
 
     near = [z for z in zones
@@ -547,7 +549,7 @@ def structure_state(spot: float, zones: list[dict], pivots: dict | None = None) 
         z = min(near, key=lambda z: abs(z["dist_pct"]))
         return {
             "signal": "WATCH",
-            "headline": (f"Spot {_px(spot)} is {abs(z['dist_pct']):.2f}% from {labels(z)} "
+            "headline": (f"Spot {_px(spot)} is {abs(z['dist_pct']):.2f}% from {z['label']} "
                          f"at {_px(z['price'])}, strength {z['strength']}/100."),
             "basis": z["basis"],
         }
@@ -561,9 +563,9 @@ def structure_state(spot: float, zones: list[dict], pivots: dict | None = None) 
         banded = True
     gaps = []
     if above:
-        gaps.append(f"{abs(above['dist_pct']):.2f}% below {labels(above)} {_px(above['price'])}")
+        gaps.append(f"{abs(above['dist_pct']):.2f}% below {above['label']} {_px(above['price'])}")
     if below:
-        gaps.append(f"{abs(below['dist_pct']):.2f}% above {labels(below)} {_px(below['price'])}")
+        gaps.append(f"{abs(below['dist_pct']):.2f}% above {below['label']} {_px(below['price'])}")
     if gaps:
         head += (", " if banded else " sits ") + " and ".join(gaps)
     return {
