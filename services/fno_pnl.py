@@ -84,12 +84,16 @@ def session_date(now: datetime | None = None) -> str:
                 return d.isoformat()
 
 
-def snapshot(positions: list[dict]) -> dict:
-    """Record today's F&O P&L, in total and per contract. Idempotent — a later
-    read the same day overwrites it. Returns the totals it wrote.
+def snapshot(positions: list[dict], user_id: int) -> dict:
+    """Record this user's F&O P&L for today, in total and per contract.
+    Idempotent — a later read the same day overwrites it. Returns the totals.
 
-    Never raises: this rides along on the live positions read, and a tracker
-    write failing must not take the user's book down with it.
+    `user_id` is required, not defaulted: a P&L row written with no owner would
+    be adopted by the ownership backfill on the next boot and land in somebody
+    else's book. A missing argument must be a TypeError, not a silent misfiling.
+
+    Never raises otherwise: this rides along on the live positions read, and a
+    tracker write failing must not take the user's book down with it.
     """
     realized = round(sum(p.get("realized") or 0.0 for p in positions), 2)
     unrealized = round(sum(p.get("unrealized") or 0.0 for p in positions), 2)
@@ -101,27 +105,28 @@ def snapshot(positions: list[dict]) -> dict:
             conn.execute(
                 """
                 INSERT INTO fno_pnl_daily
-                    (date, realized, unrealized, net, open_count, closed_count, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(date) DO UPDATE SET
+                    (user_id, date, realized, unrealized, net, open_count, closed_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, date) DO UPDATE SET
                     realized=excluded.realized, unrealized=excluded.unrealized,
                     net=excluded.net, open_count=excluded.open_count,
                     closed_count=excluded.closed_count, updated_at=excluded.updated_at
                 """,
-                (day, realized, unrealized, totals["net"],
+                (user_id, day, realized, unrealized, totals["net"],
                  sum(1 for p in positions if p.get("qty")),
                  sum(1 for p in positions if not p.get("qty")), now),
             )
             conn.executemany(
                 """
                 INSERT INTO fno_pnl_contract_daily
-                    (date, symbol, realized, unrealized, net, qty, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(date, symbol) DO UPDATE SET
+                    (user_id, date, symbol, realized, unrealized, net, qty, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, date, symbol) DO UPDATE SET
                     realized=excluded.realized, unrealized=excluded.unrealized,
                     net=excluded.net, qty=excluded.qty, updated_at=excluded.updated_at
                 """,
-                [(day, p["symbol"], p.get("realized") or 0.0, p.get("unrealized") or 0.0,
+                [(user_id, day, p["symbol"], p.get("realized") or 0.0,
+                  p.get("unrealized") or 0.0,
                   (p.get("realized") or 0.0) + (p.get("unrealized") or 0.0),
                   p.get("qty") or 0, now)
                  for p in positions if p.get("symbol")],
@@ -214,8 +219,12 @@ def _fy_chunks(start: date, end: date) -> list[tuple[str, str]]:
     return out
 
 
-def backfill(years: int = 3) -> dict:
-    """Rebuild the daily record from the broker's own trade history.
+def backfill(user_id: int, years: int = 3) -> dict:
+    """Rebuild THIS user's daily record from THEIR broker's trade history.
+
+    The trades come from the Upstox token resolved for the signed-in user, so
+    the rows written are that user's and are keyed as such. `user_id` is
+    required for the same reason as in `snapshot`.
 
     The positions API only ever knows today, so without this the tracker starts
     empty and every window shows the same single session. Trade history goes
@@ -270,27 +279,34 @@ def backfill(years: int = 3) -> dict:
                 conn.execute(
                     """
                     INSERT INTO fno_pnl_daily
-                        (date, realized, unrealized, net, open_count, closed_count, updated_at, source)
-                    VALUES (?, ?, 0, ?, 0, ?, ?, 'trades')
-                    ON CONFLICT(date) DO UPDATE SET
+                        (user_id, date, realized, unrealized, net, open_count, closed_count, updated_at, source)
+                    VALUES (?, ?, ?, 0, ?, 0, ?, ?, 'trades')
+                    ON CONFLICT(user_id, date) DO UPDATE SET
                         realized=excluded.realized, net=excluded.net,
                         closed_count=excluded.closed_count, updated_at=excluded.updated_at,
                         source='trades'
                     WHERE fno_pnl_daily.source != 'live'
+                       -- ...unless that live row is a no-signal snapshot (nothing open,
+                       -- nothing closed) — the app catching an empty intraday book on a
+                       -- day it wasn't open to see the trade isn't better information
+                       -- than the trade record itself, and would otherwise wedge that
+                       -- day at a permanent, wrong 0 forever.
+                       OR (fno_pnl_daily.open_count = 0 AND fno_pnl_daily.closed_count = 0)
                     """,
-                    (day, total, total,
+                    (user_id, day, total, total,
                      sum(1 for (d, _) in realized if d == day), now),
                 )
                 written += 1
             conn.executemany(
                 """
                 INSERT INTO fno_pnl_contract_daily
-                    (date, symbol, realized, unrealized, net, qty, updated_at)
-                VALUES (?, ?, ?, 0, ?, 0, ?)
-                ON CONFLICT(date, symbol) DO UPDATE SET
+                    (user_id, date, symbol, realized, unrealized, net, qty, updated_at)
+                VALUES (?, ?, ?, ?, 0, ?, 0, ?)
+                ON CONFLICT(user_id, date, symbol) DO UPDATE SET
                     realized=excluded.realized, net=excluded.net, updated_at=excluded.updated_at
                 """,
-                [(day, key, v, v, now) for (day, key), v in realized.items() if day < current],
+                [(user_id, day, key, v, v, now)
+                 for (day, key), v in realized.items() if day < current],
             )
     except Exception as e:
         logger.warning(f"F&O P&L backfill write failed: {e}")
@@ -304,10 +320,14 @@ def backfill(years: int = 3) -> dict:
             "errors": errors}
 
 
-def history(start: str | None = None, end: str | None = None) -> dict:
-    """Recorded sessions between `start` and `end` (inclusive, ISO dates),
-    oldest first, with the running curve, the per-contract breakdown over the
-    same slice, and summary stats.
+def history(user_id: int, start: str | None = None, end: str | None = None) -> dict:
+    """This user's recorded sessions between `start` and `end` (inclusive, ISO
+    dates), oldest first, with the running curve, the per-contract breakdown
+    over the same slice, and summary stats.
+
+    `user_id` comes from the caller's bearer token and is first and required —
+    there is no way to ask this function for somebody else's book, and no way to
+    forget to ask it for one book in particular.
 
     A date range rather than a session count: the UI filters by year and month,
     and asking for "the last N sessions" cannot answer "March 2026". `months`
@@ -323,12 +343,13 @@ def history(start: str | None = None, end: str | None = None) -> dict:
             rows = [dict(r) for r in conn.execute(
                 """SELECT date, realized, unrealized, net, open_count, closed_count,
                           COALESCE(source, 'live') AS source
-                   FROM fno_pnl_daily WHERE date BETWEEN ? AND ?
-                   ORDER BY date""", (lo, hi)
+                   FROM fno_pnl_daily WHERE user_id = ? AND date BETWEEN ? AND ?
+                   ORDER BY date""", (user_id, lo, hi)
             )]
-            contracts = _contracts(conn, lo, hi)
+            contracts = _contracts(conn, user_id, lo, hi)
             months = [r[0] for r in conn.execute(
-                "SELECT DISTINCT substr(date, 1, 7) FROM fno_pnl_daily ORDER BY 1")]
+                "SELECT DISTINCT substr(date, 1, 7) FROM fno_pnl_daily "
+                "WHERE user_id = ? ORDER BY 1", (user_id,))]
     except Exception as e:
         logger.warning(f"F&O P&L history read failed: {e}")
         return {"days": [], "contracts": [], "months": [], "stats": _stats([])}
@@ -340,7 +361,7 @@ def history(start: str | None = None, end: str | None = None) -> dict:
     return {"days": rows, "contracts": contracts, "months": months, "stats": _stats(rows)}
 
 
-def _contracts(conn, lo: str, hi: str) -> list[dict]:
+def _contracts(conn, user_id: int, lo: str, hi: str) -> list[dict]:
     """Per-contract totals over the window, biggest absolute mover first, each
     tagged with its underlying and right so the UI can filter without parsing
     symbols in the browser."""
@@ -348,8 +369,8 @@ def _contracts(conn, lo: str, hi: str) -> list[dict]:
     for r in conn.execute(
         """SELECT symbol, SUM(realized) AS realized, SUM(unrealized) AS unrealized,
                   SUM(net) AS net, COUNT(*) AS sessions
-           FROM fno_pnl_contract_daily WHERE date BETWEEN ? AND ?
-           GROUP BY symbol ORDER BY ABS(SUM(net)) DESC LIMIT 60""", (lo, hi)
+           FROM fno_pnl_contract_daily WHERE user_id = ? AND date BETWEEN ? AND ?
+           GROUP BY symbol ORDER BY ABS(SUM(net)) DESC LIMIT 60""", (user_id, lo, hi)
     ):
         underlying, right = parse_contract(r["symbol"])
         out.append({"symbol": r["symbol"], "underlying": underlying, "right": right,

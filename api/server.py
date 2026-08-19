@@ -12,6 +12,8 @@ Run (docker): a 'api' service in docker-compose reuses the main image.
 from __future__ import annotations
 import asyncio
 import contextlib
+import contextvars
+import http.cookies
 import logging
 import re
 import time
@@ -20,6 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.middleware import Middleware
@@ -29,6 +32,10 @@ from api.ws import ws_endpoint, manager as ws_manager
 from api.udf import routes as udf_routes
 
 from db import get_connection
+# Imported at module scope on purpose: services.auth raises if ARTHA_SECRET_KEY
+# is missing, so the API refuses to start rather than coming up with credential
+# encryption silently broken.
+from services import auth
 
 # httpx logs the full request URL at INFO. Several upstreams take their
 # credential as a query parameter (SerpAPI `api_key=`, Finnhub `token=`), so
@@ -141,15 +148,25 @@ def cached(ttl: float):
         return wrap
     return deco
 
+def _in_request_context(fn, *a):
+    """Carry the current context (the signed-in user) into a worker thread.
+
+    `run_in_executor` does NOT copy contextvars, unlike `asyncio.to_thread`. The
+    services that read credentials all run on these pools, so without this the
+    per-user key lookup would see no user and silently use the .env fallback for
+    every request.
+    """
+    return functools.partial(contextvars.copy_context().run, fn, *a)
+
 async def run(fn, *a):
     """Run a blocking service call off the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_POOL, fn, *a)
+    return await loop.run_in_executor(_POOL, _in_request_context(fn, *a))
 
 async def run_llm(fn, *a):
     """Run a slow LLM/agent call off the event loop, on the dedicated pool."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_LLM_POOL, fn, *a)
+    return await loop.run_in_executor(_LLM_POOL, _in_request_context(fn, *a))
 
 def ok(data):  # attach ok flag without clobbering service-provided one
     if isinstance(data, dict):
@@ -573,6 +590,18 @@ def _cached_call_arg(key, fn, arg, ttl):
     return _swr(key, lambda: fn(arg), ttl)
 
 
+def _ukey(req, name: str) -> str:
+    """Cache key for data that belongs to ONE user.
+
+    `_cache` is process-wide. A per-user payload stored under a plain name
+    ("positions", "holdings") is served to whoever asks next, which would defeat
+    every user_id filter behind it — the leak happens in front of the database,
+    not in it. Anything derived from a broker token or from the user-scoped
+    tables goes through here.
+    """
+    return f"{name}:{req.state.user_id}"
+
+
 # ======================================================================
 # AI Analyst — real agent for a detected symbol, else llm_client free-form.
 # ======================================================================
@@ -951,10 +980,18 @@ async def brief(req):
 
 # ======================================================================
 # Alerts — real persistence (create/list/delete). Table lives in db/schema.sql.
+#
+# Every statement below filters on `req.state.user_id`, the id the bearer
+# middleware read off the CALLER's token. No route in this file takes a user id
+# from the client, so there is nothing to guess: an id that belongs to somebody
+# else simply matches no row, and the delete answers 404 rather than reporting
+# success for a row it never touched.
 # ======================================================================
 async def alerts_list(req):
     with get_connection() as conn:
-        rows = conn.execute("SELECT id, symbol, type, condition, status, created FROM alerts ORDER BY created DESC").fetchall()
+        rows = conn.execute(
+            "SELECT id, symbol, type, condition, status, created FROM alerts "
+            "WHERE user_id=? ORDER BY created DESC", (req.state.user_id,)).fetchall()
     return JSONResponse({"ok": True, "items": [dict(r) for r in rows]})
 
 async def alerts_create(req):
@@ -965,7 +1002,9 @@ async def alerts_create(req):
     if not sym or not cond:
         return JSONResponse({"ok": False, "error": "symbol and condition required"})
     with get_connection() as conn:
-        cur = conn.execute("INSERT INTO alerts (symbol, type, condition, status) VALUES (?,?,?, 'active')", (sym, typ, cond))
+        cur = conn.execute(
+            "INSERT INTO alerts (symbol, type, condition, status, user_id) "
+            "VALUES (?,?,?, 'active', ?)", (sym, typ, cond, req.state.user_id))
         conn.commit()
         new_id = cur.lastrowid
     return JSONResponse({"ok": True, "id": new_id})
@@ -973,20 +1012,30 @@ async def alerts_create(req):
 async def alerts_delete(req):
     aid = int(req.path_params["id"])
     with get_connection() as conn:
-        conn.execute("DELETE FROM alerts WHERE id=?", (aid,))
+        cur = conn.execute("DELETE FROM alerts WHERE id=? AND user_id=?",
+                           (aid, req.state.user_id))
         conn.commit()
+    if not cur.rowcount:
+        # 404, not 403, and the same answer for "no such alert" as for
+        # "somebody else's alert" — telling them apart would confirm that the id
+        # exists, which is the only thing an id-guesser is actually after.
+        return JSONResponse({"ok": False, "error": "no such alert"}, status_code=404)
     return JSONResponse({"ok": True})
 
 
 # ======================================================================
 # Watchlists — real persistence (multiple named lists of symbols). No
 # hardcoded/mock lists — starts empty, user creates lists and adds symbols.
-# Tables live in db/schema.sql.
+# Tables live in db/schema.sql. Scoped to the caller, same as alerts above.
 # ======================================================================
 async def watchlists_list(req):
     with get_connection() as conn:
-        lists = conn.execute("SELECT id, name, created FROM watchlists ORDER BY created ASC").fetchall()
-        items = conn.execute("SELECT list_id, symbol FROM watchlist_items ORDER BY added ASC").fetchall()
+        lists = conn.execute("SELECT id, name, created FROM watchlists "
+                             "WHERE user_id=? ORDER BY created ASC",
+                             (req.state.user_id,)).fetchall()
+        items = conn.execute("SELECT list_id, symbol FROM watchlist_items "
+                             "WHERE user_id=? ORDER BY added ASC",
+                             (req.state.user_id,)).fetchall()
     by_list: dict[int, list[str]] = {}
     for it in items:
         by_list.setdefault(it["list_id"], []).append(it["symbol"])
@@ -1001,7 +1050,11 @@ async def watchlists_create(req):
         return JSONResponse({"ok": False, "error": "name required"})
     with get_connection() as conn:
         try:
-            cur = conn.execute("INSERT INTO watchlists (name) VALUES (?)", (name,))
+            # UNIQUE is (user_id, name) since the scoping migration — two people
+            # may both keep a list called "Tech", and neither learns the other
+            # has one.
+            cur = conn.execute("INSERT INTO watchlists (name, user_id) VALUES (?,?)",
+                               (name, req.state.user_id))
             conn.commit()
         except Exception:
             return JSONResponse({"ok": False, "error": "a list with that name already exists"})
@@ -1017,8 +1070,11 @@ async def watchlists_delete(req):
         # prices_daily/fundamentals/agent_cache already violate those FKs, so a
         # global pragma would make ingestion inserts raise IntegrityError.
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("DELETE FROM watchlists WHERE id=?", (lid,))
+        cur = conn.execute("DELETE FROM watchlists WHERE id=? AND user_id=?",
+                           (lid, req.state.user_id))
         conn.commit()
+    if not cur.rowcount:
+        return JSONResponse({"ok": False, "error": "no such watchlist"}, status_code=404)
     return JSONResponse({"ok": True})
 
 async def watchlist_add_symbol(req):
@@ -1028,7 +1084,10 @@ async def watchlist_add_symbol(req):
     if not sym:
         return JSONResponse({"ok": False, "error": "symbol required"})
     with get_connection() as conn:
-        conn.execute("INSERT OR IGNORE INTO watchlist_items (list_id, symbol) VALUES (?,?)", (lid, sym))
+        if not _owned_list(conn, lid, req.state.user_id):
+            return JSONResponse({"ok": False, "error": "no such watchlist"}, status_code=404)
+        conn.execute("INSERT OR IGNORE INTO watchlist_items (list_id, symbol, user_id) "
+                     "VALUES (?,?,?)", (lid, sym, req.state.user_id))
         conn.commit()
     return JSONResponse({"ok": True})
 
@@ -1036,9 +1095,22 @@ async def watchlist_remove_symbol(req):
     lid = int(req.path_params["id"])
     sym = req.path_params["symbol"].upper()
     with get_connection() as conn:
-        conn.execute("DELETE FROM watchlist_items WHERE list_id=? AND symbol=?", (lid, sym))
+        if not _owned_list(conn, lid, req.state.user_id):
+            return JSONResponse({"ok": False, "error": "no such watchlist"}, status_code=404)
+        # Removing a symbol that is not in the list stays a 200 no-op — delete
+        # is idempotent for the list's owner. Ownership is what 404s.
+        conn.execute("DELETE FROM watchlist_items WHERE list_id=? AND symbol=? AND user_id=?",
+                     (lid, sym, req.state.user_id))
         conn.commit()
     return JSONResponse({"ok": True})
+
+
+def _owned_list(conn, list_id: int, user_id: int) -> bool:
+    """Does this list exist AND belong to this caller? The item routes address a
+    list by id in the URL, so this is the check that stops one account writing
+    into another's list."""
+    return conn.execute("SELECT 1 FROM watchlists WHERE id=? AND user_id=?",
+                        (list_id, user_id)).fetchone() is not None
 
 
 # ======================================================================
@@ -1051,7 +1123,8 @@ def _upstox_status() -> dict:
             "login_url": authorize_url(), "saved_at": token_saved_at()}
 
 async def upstox_status(req):
-    return JSONResponse({"ok": True, **await run(_cached_call, "upstox_status", _upstox_status, 60)})
+    return JSONResponse({"ok": True, **await run(
+        _cached_call, _ukey(req, "upstox_status"), _upstox_status, 60)})
 
 async def upstox_token(req):
     """Exchange an OAuth code (or full redirect URL) for a fresh daily token."""
@@ -1069,9 +1142,10 @@ async def upstox_token(req):
     # reasonably concluded it had failed and logged in again; the logs show
     # three successful exchanges in 62 seconds.
     if isinstance(res, dict) and res.get("ok"):
-        for key in ("upstox_status", "system_status", "data_health",
+        _cache.pop("data_health", None)   # shared, not per-user
+        for key in ("upstox_status", "system_status",
                     "holdings", "positions", "portfolio_curve"):
-            _cache.pop(key, None)
+            _cache.pop(_ukey(req, key), None)
     return JSONResponse(res if isinstance(res, dict) else {"ok": False})
 
 def _system_status() -> dict:
@@ -1086,7 +1160,8 @@ def _system_status() -> dict:
     }
 
 async def system_status(req):
-    return JSONResponse({"ok": True, **await run(_cached_call, "system_status", _system_status, 60)})
+    return JSONResponse({"ok": True, **await run(
+        _cached_call, _ukey(req, "system_status"), _system_status, 60)})
 
 
 def _holdings() -> dict:
@@ -1122,14 +1197,14 @@ def _holdings() -> dict:
     return {"ok": True, "status": "ok", "items": items}
 
 async def holdings(req):
-    return JSONResponse(await run(_cached_call, "holdings", _holdings, 120))
+    return JSONResponse(await run(_cached_call, _ukey(req, "holdings"), _holdings, 120))
 
 
 # Derivatives segments. An equity position in the same book is not part of the
 # F&O surface and is dropped rather than shown under an F&O heading.
 _FNO_EXCHANGES = ("NFO", "BFO")
 
-def _positions() -> dict:
+def _positions(user_id: int) -> dict:
     """The user's live F&O positions — READ-ONLY.
 
     Reads the book and nothing else: no order is placed, modified or cancelled
@@ -1191,14 +1266,27 @@ def _positions() -> dict:
     # Realised is booked on every row — a squared-off contract's whole P&L lives
     # there — while unrealised only exists while something is still open.
     from services.fno_pnl import snapshot
-    totals = snapshot(items + done)
+    totals = snapshot(items + done, user_id)
+    # The snapshot just wrote a fresher today's row than whatever /api/fno/pnl
+    # has cached — without this the tracker's "Today (live)" tile (read straight
+    # off this same book, no cache) and its session table/totals (served from
+    # the stale cache) show two different numbers for the same session.
+    suffix = f":{user_id}"
+    for key in [k for k in _cache if k.startswith("fno_pnl_") and k.endswith(suffix)]:
+        _cache.pop(key, None)
 
     return {"ok": True, "status": "ok", "items": items,
             "closed": len(done), "closedItems": done, **totals}
 
 async def positions(req):
-    """GET only — see the Route entry. There is no write path for this data."""
-    return JSONResponse(await run(_cached_call, "positions", _positions, 30))
+    """GET only — see the Route entry. There is no write path for this data.
+
+    The one route that WRITES a user-scoped table as a side effect: the book it
+    reads is snapshotted into fno_pnl_daily, so it has to carry the owner's id
+    down with it.
+    """
+    return JSONResponse(await run(_cached_call_arg, _ukey(req, "positions"),
+                                  _positions, req.state.user_id, 30))
 
 
 async def fno_pnl(req):
@@ -1213,8 +1301,10 @@ async def fno_pnl(req):
         v = (req.query_params.get(name) or "").strip()
         return v if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
     lo, hi = _date("from"), _date("to")
+    uid = req.state.user_id
     return JSONResponse({"ok": True, **await run(
-        _cached_call_arg, f"fno_pnl_{lo}_{hi}", lambda a: history(*a), (lo, hi), 60)})
+        _cached_call_arg, _ukey(req, f"fno_pnl_{lo}_{hi}"),
+        lambda a: history(*a), (uid, lo, hi), 60)})
 
 
 async def fno_pnl_backfill(req):
@@ -1224,9 +1314,12 @@ async def fno_pnl_backfill(req):
     — there is no order path here, same as every other route in this file.
     """
     from services.fno_pnl import backfill
-    res = await run(backfill, 3)
-    # Every window's cached history is stale the moment this lands.
-    for key in [k for k in _cache if k.startswith("fno_pnl_")]:
+    res = await run(backfill, req.state.user_id, 3)
+    # Every window's cached history is stale the moment this lands — but only
+    # THIS user's. Clearing the shared prefix would evict other accounts' curves
+    # and make them re-query, which is harmless but pointless.
+    suffix = f":{req.state.user_id}"
+    for key in [k for k in _cache if k.startswith("fno_pnl_") and k.endswith(suffix)]:
         _cache.pop(key, None)
     return JSONResponse(res)
 
@@ -1389,7 +1482,8 @@ def _risk_metrics(points: list[dict]) -> dict:
 
 
 async def portfolio_curve(req):
-    return JSONResponse(await run(_cached_call, "portfolio_curve", _portfolio_curve, 300))
+    return JSONResponse(await run(
+        _cached_call, _ukey(req, "portfolio_curve"), _portfolio_curve, 300))
 
 
 async def ensure_fresh(req):
@@ -1449,8 +1543,326 @@ async def ingestion_run(req):
     return JSONResponse(res, status_code=200 if res.get("ok") else 409)
 
 
+# ======================================================================
+# Authentication — register / login / logout / me, plus the Bearer gate
+# that stands in front of every other route in this file.
+# ======================================================================
+#
+# ALLOWLIST, not a denylist. These three paths are open; everything else needs a
+# token. A route added to `routes` below tomorrow is therefore protected without
+# anyone remembering to protect it, which is the only version of this that stays
+# true over time.
+PUBLIC_PATHS = frozenset({
+    "/api/health", "/api/auth/register", "/api/auth/login",
+    # API docs are meant to be readable BEFORE anyone holds a token — that is
+    # the point of publishing them. Neither route touches user data: the spec
+    # is generated from route shapes, not live data, and the UI is static HTML.
+    "/api/openapi.json", "/api/docs",
+    # The registration wizard tests a key BEFORE an account exists — this
+    # route stores nothing, it only calls the real provider and reports the
+    # verdict. The worst an unauthenticated caller does here is test a key
+    # they already hold; /api/auth/keys (which actually STORES one) is not
+    # in this set and stays behind the gate.
+    "/api/auth/test-key",
+})
+
+
+# Must match web/middleware.ts's SESSION_COOKIE. Only the websocket path relies
+# on this: the browser's WebSocket API cannot set an Authorization header, so
+# /ws is reached directly (not through a Next.js proxy that would attach one)
+# and has no credential to offer except the httpOnly cookie the browser sends
+# automatically on the handshake. The token value never reaches page JS either
+# way — this only reads what the browser already attaches on its own.
+_SESSION_COOKIE_NAME = "artha_session"
+
+
+def _bearer_token(scope) -> str | None:
+    """The token out of `Authorization: Bearer <token>`, falling back to the
+    session cookie if there is no such header.
+
+    Raw ASGI headers rather than a Request object so the same code covers
+    websocket connections.
+    """
+    cookie_token = None
+    for k, v in scope.get("headers") or []:
+        if k.lower() == b"authorization":
+            value = v.decode("latin-1")
+            scheme, _, token = value.partition(" ")
+            if scheme.lower() == "bearer":
+                return token.strip() or None
+            return None
+        if k.lower() == b"cookie":
+            jar = http.cookies.SimpleCookie()
+            jar.load(v.decode("latin-1"))
+            morsel = jar.get(_SESSION_COOKIE_NAME)
+            if morsel:
+                cookie_token = morsel.value
+    return cookie_token
+
+
+class BearerAuthMiddleware:
+    """Default-deny bearer authentication for the whole app.
+
+    Plain ASGI (not BaseHTTPMiddleware) so websocket connections go through the
+    same gate instead of silently bypassing it.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        if scope["type"] == "http" and scope.get("path") in PUBLIC_PATHS:
+            return await self.app(scope, receive, send)
+
+        # A local indexed SQLite read, but still IO — off the event loop.
+        user_id = await run_in_threadpool(auth.session_user, _bearer_token(scope))
+        if user_id is None:
+            if scope["type"] == "websocket":
+                # 1008 = policy violation. No 401 exists for websockets.
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            return await JSONResponse(
+                {"ok": False, "error": "authentication required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )(scope, receive, send)
+
+        # request.state.user_id for handlers; the ContextVar for everything
+        # deeper (config's per-user credential lookup), which cannot reach the
+        # request object.
+        scope.setdefault("state", {})["user_id"] = user_id
+        ctx_token = auth.current_user_id.set(user_id)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            auth.current_user_id.reset(ctx_token)
+
+
+async def _json_body(req) -> dict:
+    try:
+        body = await req.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _truthy(v) -> bool:
+    return v is True or (isinstance(v, str) and v.strip().lower() in ("true", "1", "yes"))
+
+
+# ---- per-IP rate limit for auth routes ----
+#
+# scrypt's cost throttles a single-threaded guesser but not a distributed one —
+# nothing upstream of this process caps request rate. In-memory sliding window,
+# no new dependency: this is a single uvicorn process (docker-compose runs it
+# with no --workers), so one dict is the whole picture: a multi-worker/multi-
+# instance deployment would need a shared store (Redis) instead.
+_AUTH_ATTEMPTS: dict[str, list[float]] = {}
+_AUTH_LOCK = threading.Lock()
+
+
+def _rate_limited(key: str, limit: int, window_s: float) -> bool:
+    """True (and records nothing further) if `key` has hit `limit` hits within
+    the trailing `window_s` seconds; otherwise records this hit and returns
+    False. Prunes its own key's expired entries on every call — no separate
+    sweep needed at this volume."""
+    now = time.time()
+    with _AUTH_LOCK:
+        hits = [t for t in _AUTH_ATTEMPTS.get(key, ()) if now - t < window_s]
+        if len(hits) >= limit:
+            _AUTH_ATTEMPTS[key] = hits
+            return True
+        hits.append(now)
+        _AUTH_ATTEMPTS[key] = hits
+        return False
+
+
+def _client_ip(req) -> str:
+    return req.client.host if req.client else "unknown"
+
+
+def _too_many_requests(retry_after: int) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": "Too many attempts. Try again shortly."},
+        status_code=429, headers={"Retry-After": str(retry_after)},
+    )
+
+
+# Every credential the registration wizard (or Settings, later) may submit —
+# the same env-var names config.py already reads via auth.resolve_key's
+# user-key-then-.env fallback. A name outside this set is rejected rather than
+# stored: user_api_keys has no FK to anything that would ever read it back.
+_KNOWN_KEY_PROVIDERS = frozenset({
+    "UPSTOX_ANALYTICS_TOKEN", "UPSTOX_CLIENT_ID", "UPSTOX_CLIENT_SECRET",
+    "UPSTOX_ACCESS_TOKEN", "UPSTOX_REDIRECT_URI",
+    "GROQ_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "NVIDIA_API_KEY",
+    "SAMBANOVA_API_KEY", "GITHUB_MODELS_TOKEN", "ANTHROPIC_API_KEY",
+    "FINNHUB_API_KEY", "SERPAPI_KEY", "SERPER_API_KEY", "BING_API_KEY",
+    "JINA_API_KEY", "SEARXNG_URL",
+})
+
+
+async def auth_register(req):
+    # 5 accounts/hour/IP — generous for a real signup, tight against a script
+    # farming accounts (or probing the existence-leak noted on the 400 below).
+    if _rate_limited(f"register:{_client_ip(req)}", limit=5, window_s=3600):
+        return _too_many_requests(3600)
+    b = await _json_body(req)
+    email = auth.normalize_email(b.get("email") or "")
+    password = b.get("password") or ""
+    if not isinstance(password, str) or not auth.EMAIL_RE.match(email) \
+            or len(email) > auth.MAX_EMAIL_LENGTH:
+        return JSONResponse({"ok": False, "error": "a valid email address is required"},
+                            status_code=400)
+    if not (auth.MIN_PASSWORD_LENGTH <= len(password) <= auth.MAX_PASSWORD_LENGTH):
+        return JSONResponse(
+            {"ok": False,
+             "error": f"password must be at least {auth.MIN_PASSWORD_LENGTH} characters"},
+            status_code=400)
+
+    user_id = await run_in_threadpool(auth.create_user, email, password)
+    if user_id is None:
+        # Deliberately generic: "that email is already registered" turns this
+        # route into an account checker for anyone who can reach it.
+        # ponytail: the 400-vs-200 split still leaks existence to a determined
+        # prober. Closing that needs email verification (send the link either
+        # way, say nothing here) — worth it only once mail exists.
+        return JSONResponse({"ok": False, "error": "could not create that account"},
+                            status_code=400)
+
+    # The registration wizard collects broker/AI/enrichment keys before the
+    # account exists, so they land here rather than a second round trip.
+    # Whitelisted against config's known env names: an unrecognised key would
+    # sit in user_api_keys forever, encrypted, resolved by nothing (R17-style
+    # dead weight) — reject it instead of silently accepting garbage.
+    keys = b.get("keys")
+    if isinstance(keys, dict):
+        for provider, value in keys.items():
+            if (isinstance(provider, str) and provider in _KNOWN_KEY_PROVIDERS
+                    and isinstance(value, str) and value.strip()):
+                await run_in_threadpool(auth.save_key, user_id, provider, value.strip())
+
+    # Sign the new account in immediately — the wizard's last screen shows a
+    # summary and an "Open the terminal" button, which needs a live session
+    # already in hand rather than a second trip through /login.
+    token, expires_at = await run_in_threadpool(
+        auth.create_session, user_id, False, req.headers.get("user-agent"))
+    return JSONResponse({"ok": True, "user_id": user_id, "email": email,
+                         "token": token, "expires_at": expires_at}, status_code=201)
+
+
+async def auth_login(req):
+    # 10 attempts/5 min/IP. Keyed on IP alone, not email: keying on email too
+    # would let an attacker rotate the target email to dodge the limit, and a
+    # correct login still counts against it (simpler than tracking failures
+    # only, and a legitimate user mistyping a password 10 times in 5 minutes
+    # is already having a bad time).
+    if _rate_limited(f"login:{_client_ip(req)}", limit=10, window_s=300):
+        return _too_many_requests(300)
+
+    b = await _json_body(req)
+    email = b.get("email") or ""
+    password = b.get("password") or ""
+    if not isinstance(password, str) or not isinstance(email, str):
+        return JSONResponse({"ok": False, "error": "invalid email or password"}, status_code=401)
+
+    # authenticate() does the scrypt work even for an unknown email, so this
+    # route cannot be used to tell registered addresses from unregistered ones.
+    user_id = await run_in_threadpool(auth.authenticate, email, password)
+    if user_id is None:
+        return JSONResponse({"ok": False, "error": "invalid email or password"}, status_code=401)
+
+    remember = _truthy(b.get("remember"))
+    token, expires_at = await run_in_threadpool(
+        auth.create_session, user_id, remember, req.headers.get("user-agent"))
+    return JSONResponse({"ok": True, "token": token, "expires_at": expires_at,
+                         "remember": remember, "user_id": user_id,
+                         "email": auth.normalize_email(email)})
+
+
+async def auth_logout(req):
+    # The middleware already validated it; deleting the row revokes it now.
+    await run_in_threadpool(auth.delete_session, _bearer_token(req.scope))
+    return JSONResponse({"ok": True})
+
+
+async def auth_me(req):
+    user = await run_in_threadpool(auth.get_user, req.state.user_id)
+    if not user:
+        return JSONResponse({"ok": False, "error": "authentication required"}, status_code=401)
+    providers = await run_in_threadpool(auth.list_key_providers, user["id"])
+    # Provider NAMES only. A stored key never travels back to a client.
+    return JSONResponse({"ok": True, "user": user, "keys": providers})
+
+
+async def auth_test_key(req):
+    """Calls the real provider with a key the caller has NOT saved yet — the
+    registration wizard and Settings both hit this before storing anything, so
+    a typo fails on the screen where it was made. Public: it stores nothing and
+    the worst an unauthenticated caller achieves is testing a key they already
+    hold. See services/key_test.py for why this bypasses every config-bound
+    service class in the repo rather than reusing one."""
+    from services.key_test import test_key
+    b = await _json_body(req)
+    provider = b.get("provider")
+    value = b.get("key")
+    if not isinstance(provider, str) or provider not in _KNOWN_KEY_PROVIDERS:
+        return JSONResponse({"ok": False, "error": "unknown provider"}, status_code=400)
+    if not isinstance(value, str):
+        return JSONResponse({"ok": False, "error": "key is required"}, status_code=400)
+    result = await test_key(provider, value)
+    return JSONResponse(result)
+
+
+async def auth_save_key(req):
+    """Store one credential for the signed-in user. Takes effect on the very
+    next request — auth.resolve_key reads live, config.py freezes nothing."""
+    b = await _json_body(req)
+    provider = b.get("provider")
+    value = b.get("key")
+    if not isinstance(provider, str) or provider not in _KNOWN_KEY_PROVIDERS:
+        return JSONResponse({"ok": False, "error": "unknown provider"}, status_code=400)
+    if not isinstance(value, str) or not value.strip():
+        return JSONResponse({"ok": False, "error": "key is required"}, status_code=400)
+    await run_in_threadpool(auth.save_key, req.state.user_id, provider, value.strip())
+    return JSONResponse({"ok": True})
+
+
+async def auth_delete_key(req):
+    provider = req.path_params.get("provider")
+    if provider not in _KNOWN_KEY_PROVIDERS:
+        return JSONResponse({"ok": False, "error": "unknown provider"}, status_code=400)
+    await run_in_threadpool(auth.delete_key, req.state.user_id, provider)
+    return JSONResponse({"ok": True})
+
+
+async def openapi_json(req):
+    from api.openapi import build_spec
+    # Built from `routes` below, not a static file — the route table IS the
+    # source of truth, so the two can never drift the way hand-maintained API
+    # docs always eventually do.
+    return JSONResponse(build_spec(routes))
+
+
+async def api_docs(req):
+    from starlette.responses import HTMLResponse
+    from api.openapi import swagger_ui_html
+    return HTMLResponse(swagger_ui_html("/api/openapi.json"))
+
+
 routes = [
     Route("/api/health", health),
+    Route("/api/auth/register", auth_register, methods=["POST"]),
+    Route("/api/auth/login", auth_login, methods=["POST"]),
+    Route("/api/auth/logout", auth_logout, methods=["POST"]),
+    Route("/api/auth/me", auth_me, methods=["GET"]),
+    Route("/api/auth/test-key", auth_test_key, methods=["POST"]),
+    Route("/api/auth/keys", auth_save_key, methods=["POST"]),
+    Route("/api/auth/keys/{provider}", auth_delete_key, methods=["DELETE"]),
+    Route("/api/openapi.json", openapi_json, methods=["GET"]),
+    Route("/api/docs", api_docs, methods=["GET"]),
     Route("/api/universe", universe),
     Route("/api/stock/{symbol}", stock),
     Route("/api/stock/{symbol}/analysis", stock_analysis),
@@ -1618,7 +2030,15 @@ app = Starlette(
     routes=routes,
     lifespan=_lifespan,
     exception_handlers={Exception: unhandled},
-    middleware=[Middleware(CORSMiddleware, allow_origins=_ORIGINS, allow_methods=["*"])],
+    # CORS stays OUTERMOST: a browser preflight (OPTIONS) carries no
+    # Authorization header, so it has to be answered before the bearer gate
+    # rejects it. Auth then wraps every route, public ones included — it lets
+    # those three through itself.
+    middleware=[
+        Middleware(CORSMiddleware, allow_origins=_ORIGINS, allow_methods=["*"],
+                   allow_headers=["*"]),
+        Middleware(BearerAuthMiddleware),
+    ],
 )
 
 if __name__ == "__main__":

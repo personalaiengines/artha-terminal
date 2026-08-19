@@ -373,7 +373,7 @@ export function PnlTracker({ book }: { book: PositionBook | null }) {
     `/api/fno/pnl${qs ? `?${qs}` : ""}`,
     { days: [], contracts: [], months: [], stats: null },
     (j) => ({ days: j.days ?? [], contracts: j.contracts ?? [], months: j.months ?? [], stats: j.stats ?? null }),
-    POLL.holdings
+    POLL.fnoPnl
   );
   const { days, contracts, stats } = hist;
 

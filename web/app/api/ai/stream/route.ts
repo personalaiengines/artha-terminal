@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { SESSION_COOKIE } from "@/middleware";
 
 // SSE passthrough to the Python agent's streaming chat.
 //
@@ -14,11 +16,16 @@ export async function POST(req: Request) {
   const q = (body?.q ?? "").toString().trim();
   if (!q) return NextResponse.json({ ok: false, error: "empty query" }, { status: 400 });
 
+  const token = (await cookies()).get(SESSION_COOKIE)?.value;
+
   let upstream: Response;
   try {
     upstream = await fetch(`${API}/api/ai/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify({ q, history: body?.history ?? [] }),
       // The agent can legitimately run for minutes on a deep dive.
       signal: AbortSignal.timeout(300000),

@@ -14,12 +14,31 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
 import api.server as server
 
-DERIVED = ("upstox_status", "system_status", "data_health", "holdings", "portfolio_curve")
+USER = 7
+# Everything downstream of the token is per-user (the broker book, the profile
+# name behind upstox_status), so those entries are keyed by user id. data_health
+# is shared market-data health and keeps its plain key.
+DERIVED = tuple(f"{k}:{USER}" for k in
+                ("upstox_status", "system_status", "holdings", "portfolio_curve")) \
+    + ("data_health",)
+
+
+class _AsUser:
+    """What BearerAuthMiddleware does in production: attach the caller's id.
+    This route is not on PUBLIC_PATHS, so it never runs without one."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        scope.setdefault("state", {})["user_id"] = USER
+        await self.app(scope, receive, send)
 
 
 def _client(monkeypatch, result):
@@ -27,7 +46,8 @@ def _client(monkeypatch, result):
     monkeypatch.setattr(auth, "exchange_code", lambda code: result)
     for key in DERIVED:
         server._cache[key] = (9e9, {"stale": True})   # far-future ts = still warm
-    app = Starlette(routes=[Route("/api/upstox/token", server.upstox_token, methods=["POST"])])
+    app = Starlette(routes=[Route("/api/upstox/token", server.upstox_token, methods=["POST"])],
+                    middleware=[Middleware(_AsUser)])
     return TestClient(app)
 
 
@@ -38,6 +58,17 @@ def test_successful_exchange_drops_every_derived_cache(monkeypatch):
     assert r.json()["ok"] is True
     still_cached = [k for k in DERIVED if k in server._cache]
     assert not still_cached, f"stale after authorize: {still_cached}"
+
+
+def test_another_users_caches_survive_the_exchange(monkeypatch):
+    """Authorizing one account must not evict everyone else's warm data — they
+    would each pay a cold broker fetch for a token that is not theirs."""
+    server._cache["holdings:99"] = (9e9, {"someone": "else"})
+    c = _client(monkeypatch, {"ok": True, "message": "saved"})
+
+    assert c.post("/api/upstox/token", json={"code": "abc"}).json()["ok"] is True
+    assert "holdings:99" in server._cache
+    server._cache.pop("holdings:99")
 
 
 def test_failed_exchange_keeps_caches(monkeypatch):

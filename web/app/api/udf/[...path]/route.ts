@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { SESSION_COOKIE } from "@/middleware";
 
 // Raw passthrough to the API's UDF datafeed, so the TradingView widget can talk to
 // ARTHA same-origin. Deliberately NOT fromApi()/sendApi(): UDF answers /time with a
@@ -7,11 +9,20 @@ import { NextResponse } from "next/server";
 // null. The widget needs the bytes verbatim, so the body is forwarded as text with
 // the upstream content-type.
 //
-// Same BASE and the same discipline as lib/api-server.ts: nothing from the browser
-// is forwarded — no cookies, no Authorization, no client headers — and nothing the
-// API holds (tokens, account ids) is added here. The datafeed is server-to-server;
-// the browser only ever sees OHLC (T12).
+// Same BASE and the same discipline as lib/api-server.ts: nothing from the BROWSER
+// is forwarded — no cookies, no client headers — and no token reaches the browser.
+// The API is default-deny (bearer middleware), so this hop reads the httpOnly
+// session cookie itself and attaches it as the one header the browser never sees.
 const BASE = process.env.ARTHA_API_URL ?? "http://localhost:8000";
+
+async function authHeader(): Promise<Record<string, string>> {
+  try {
+    const token = (await cookies()).get(SESSION_COOKIE)?.value;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
 
 async function proxy(req: Request, path: string[], method: "GET" | "POST" | "DELETE") {
   const url = `${BASE}/api/udf/${path.map(encodeURIComponent).join("/")}${new URL(req.url).search}`;
@@ -27,7 +38,10 @@ async function proxy(req: Request, path: string[], method: "GET" | "POST" | "DEL
       method, signal: ctrl.signal, cache: "no-store",
       // Content-Type is a description of our own body, not a client credential —
       // chart-layout saves (step 7) are form-encoded, not JSON.
-      headers: body ? { "Content-Type": req.headers.get("content-type") ?? "application/json" } : undefined,
+      headers: {
+        ...(body ? { "Content-Type": req.headers.get("content-type") ?? "application/json" } : {}),
+        ...(await authHeader()),
+      },
       body: body || undefined,
     });
     return new NextResponse(await res.text(), {

@@ -129,6 +129,53 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
 
+    # ---- auth: users, their encrypted API keys, and their sessions ----
+    # `email COLLATE NOCASE` puts case-insensitive uniqueness in the DB rather
+    # than trusting every call site to lowercase first (services/auth.py does,
+    # but the constraint is what makes it true).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_login_at TEXT
+        )
+        """
+    )
+
+    # One row per (user, credential). `provider` is the environment variable
+    # name the key stands in for ("UPSTOX_ANALYTICS_TOKEN"), and `ciphertext` is
+    # Fernet — the plaintext key exists only in memory, for one call.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_api_keys (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            ciphertext TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, provider)
+        )
+        """
+    )
+
+    # token_hash is the SHA-256 of the bearer token and the primary key: the raw
+    # token is never stored, so this table is worthless to anyone who dumps it.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL,
+            user_agent TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+
     # SQLite can't ALTER a CHECK constraint in place — rebuild the table (the
     # standard SQLite recipe: rename, recreate, copy, drop) only if the new
     # value isn't already accepted, so this is a no-op on every later startup.
@@ -164,6 +211,132 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT DEFAULT (datetime('now'))
         )""",
         ["CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache(expires_at)"])
+
+    _apply_user_scoping(conn)
+
+
+# The tables that hold ONE PERSON's data. Everything else in this database is
+# shared market data — prices_daily (780k rows), symbol_master, fundamentals,
+# computed_metrics — and stays global; copying it per account would multiply the
+# database for no gain, because a close is a close whoever is looking at it.
+#
+# agent_cache is deliberately NOT here. Its rows are LLM analyses of PUBLIC
+# symbols, keyed by md5("<symbol>:<analysis_type>") with no user input in the
+# key or the prompt, and the 'market_news' row is written by the scheduler
+# (ingestion/scheduler.py::_run_market_news_curation) with no signed-in user at
+# all. Scoping it would fragment a cache that is correct to share and orphan the
+# scheduler's row behind a user_id nobody holds.
+_USER_SCOPED_TABLES = ("alerts", "watchlists", "watchlist_items",
+                       "fno_pnl_daily", "fno_pnl_contract_daily")
+
+
+def _apply_user_scoping(conn: sqlite3.Connection) -> None:
+    """Give the user-owned tables a `user_id`, and hand the pre-auth rows to the
+    first registered user. Idempotent — every step checks before it acts."""
+    # alerts and watchlist_items only need the column: their keys (an
+    # AUTOINCREMENT id, and list_id which is already unique per list) stay
+    # correct across users as they are.
+    for table in ("alerts", "watchlist_items"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if cols and "user_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
+            print(f"[OK] Migration: added {table}.user_id")
+
+    # The other three need their UNIQUE / PRIMARY KEY widened as well, which
+    # SQLite cannot do in place. Without that the column alone would not isolate
+    # anyone: `watchlists.name` is globally UNIQUE, so the second user to want a
+    # list called "Tech" would be refused (and would learn that someone else has
+    # one); and fno_pnl_daily is keyed on `date` alone, so one user's snapshot
+    # UPSERT would overwrite another user's row for the same session.
+    _rebuild_with_user_id(
+        conn, "watchlists", "id, name, created",
+        """CREATE TABLE watchlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT NOT NULL,
+            created TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (user_id, name)
+        )""")
+    _rebuild_with_user_id(
+        conn, "fno_pnl_daily",
+        "date, realized, unrealized, net, open_count, closed_count, updated_at, source",
+        """CREATE TABLE fno_pnl_daily (
+            user_id INTEGER,
+            date TEXT NOT NULL,
+            realized REAL NOT NULL DEFAULT 0,
+            unrealized REAL NOT NULL DEFAULT 0,
+            net REAL NOT NULL DEFAULT 0,
+            open_count INTEGER NOT NULL DEFAULT 0,
+            closed_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            source TEXT DEFAULT 'live',
+            PRIMARY KEY (user_id, date)
+        )""")
+    _rebuild_with_user_id(
+        conn, "fno_pnl_contract_daily",
+        "date, symbol, realized, unrealized, net, qty, updated_at",
+        """CREATE TABLE fno_pnl_contract_daily (
+            user_id INTEGER,
+            date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            realized REAL NOT NULL DEFAULT 0,
+            unrealized REAL NOT NULL DEFAULT 0,
+            net REAL NOT NULL DEFAULT 0,
+            qty INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, date, symbol)
+        )""")
+
+    # A table that does not exist on this database (nothing has created it yet)
+    # is skipped rather than indexed into an error.
+    scoped = [t for t in _USER_SCOPED_TABLES
+              if "user_id" in {row[1] for row in conn.execute(f"PRAGMA table_info({t})")}]
+    for table in scoped:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}(user_id)")
+
+    # ---- one-time ownership backfill ----
+    # ASSUMPTION, stated plainly because it is a guess: every row that predates
+    # user scoping belongs to whoever registers FIRST. In this app's actual
+    # history — one person, one terminal, no auth until now — that is exactly
+    # right. It is WRONG if a second person registers before the owner does, and
+    # there is no way to tell from the data which happened. Register your own
+    # account first.
+    #
+    # Guarded on `user_id IS NULL`, so it fires once and is a no-op afterwards:
+    # every write after this migration carries its author's id. If nobody has
+    # registered yet nothing is claimed, and the rows are adopted on the next
+    # boot after the first registration.
+    first_user = conn.execute("SELECT MIN(id) FROM users").fetchone()[0]
+    if first_user is not None:
+        for table in scoped:
+            n = conn.execute(f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL",
+                             (first_user,)).rowcount
+            if n:
+                print(f"[OK] Migration: {n} pre-auth {table} rows assigned to user {first_user}")
+
+
+def _rebuild_with_user_id(conn: sqlite3.Connection, table: str, cols: str,
+                          create_sql: str) -> None:
+    """Add `user_id` to a table whose PRIMARY KEY or UNIQUE constraint has to
+    change with it. Same rename/recreate/copy/drop recipe as `_add_check_value`,
+    and a no-op once the column exists.
+
+    `legacy_alter_table` is set for the rename because modern SQLite rewrites
+    other tables' REFERENCES clauses to follow it — watchlist_items' foreign key
+    would silently repoint at `watchlists_old` and then at nothing.
+    """
+    cols_now = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if not cols_now or "user_id" in cols_now:
+        return
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+        conn.execute(create_sql)
+        conn.execute(f"INSERT INTO {table} ({cols}) SELECT {cols} FROM {table}_old")
+        conn.execute(f"DROP TABLE {table}_old")
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+    print(f"[OK] Migration: rebuilt {table} with user_id")
 
 
 def _add_check_value(conn: sqlite3.Connection, table: str, value: str,

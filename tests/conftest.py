@@ -40,3 +40,18 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "needs_data" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_rate_limit():
+    """api.server's login/register rate limiter is a module-level dict keyed
+    by client IP — every test using Starlette's TestClient shares one fixed
+    IP ("testclient"), so hits accumulate across unrelated tests in the same
+    session and a later test starts pre-throttled. Real deployments don't hit
+    this: it's an artefact of every test sharing one process and one fake IP."""
+    try:
+        from api.server import _AUTH_ATTEMPTS
+        _AUTH_ATTEMPTS.clear()
+    except Exception:
+        pass
+    yield
