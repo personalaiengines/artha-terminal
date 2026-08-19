@@ -123,8 +123,7 @@ artha-terminal/
 │   ├── levels.py          # pivots, CPR, Camarilla, prior week — settled OHLC only
 │   ├── intraday.py        # 1-minute bar store + resampler (5/15/60)
 │   ├── institutional_flows.py, market_news.py, finnhub_news.py
-│   ├── market_events.py, search.py, yahoo.py, stock_analysis_llm.py
-│   └── tradingview_bridge.py   # optional TradingView Desktop CDP bridge
+│   └── market_events.py, search.py, yahoo.py, stock_analysis_llm.py
 │
 ├── db/
 │   ├── schema.sql         # symbol_master, prices_daily, fundamentals,
@@ -194,7 +193,6 @@ in [`web/lib/poll.ts`](https://github.com/personalaiengines/artha-terminal/blob/
 |---|---|
 | `live_quotes` | every 3 min, 09:00–15:59, Mon–Fri |
 | `market_news_curation` | every 10 min |
-| `fno_game_plan` | 08:45, Mon–Fri |
 | `price_etl` | 20:30 daily |
 | `index_history` | 20:45 daily |
 | `symbol_etl` | 21:00 Mon |
@@ -558,33 +556,18 @@ MIT
 
 # Appendix · F&O chart drawing
 
-Two independent paths to see support/resistance, max-pain, OI-wall and pivot
-levels on a live chart.
-
-**Path 1 — in the app (default).** [`web/components/widgets/kline-chart.tsx`](https://github.com/personalaiengines/artha-terminal/blob/master/web/components/widgets/kline-chart.tsx),
+Support/resistance, max-pain, OI-wall and pivot levels are drawn in the app
+itself: [`web/components/widgets/kline-chart.tsx`](https://github.com/personalaiengines/artha-terminal/blob/master/web/components/widgets/kline-chart.tsx),
 built on [KLineChart](https://klinecharts.com) (Apache-2.0), documented in full
 under **The F&O chart** below. Levels, drawing tools, indicators and live ticks
 in the page itself — no external app, no licence to apply for.
 
-**Path 2 — TradingView Desktop bridge (optional).** Draws the same levels on the
-real TradingView app over the Chrome DevTools Protocol. Genuinely tick-live,
-but needs a paid/limited TV, an interactive logon session, and tolerance for CDP
-fragility.
-
-- `services/tradingview_bridge.py` — `draw_levels`, `ensure_running`,
-  `clear_artha_lines`, `unfreeze`
-- `scripts/draw_now.py` — one-shot draw
-- `scripts/draw_live.py` — redraws every `ARTHA_DRAW_INTERVAL` s (default 60,
-  floor 15) during 09:15–15:30 IST, then exits
-- `scripts/fno_daily.py`, `scripts/install_live_task.ps1` — Windows Task
-  Scheduler wiring
-
-*The frozen-chart bug:* drawing could leave the page's V8 debugger paused, which
-halts the JS loop — the websocket keeps receiving but nothing renders.
-`unfreeze()` opens a fresh CDP session and sends `Debugger.enable` +
-`Debugger.resume`; it runs automatically after every live `draw_levels`.
+A second path once mirrored these levels onto TradingView Desktop over the
+Chrome DevTools Protocol (`services/tradingview_bridge.py` + the `draw_*`
+scripts) — removed: the in-app chart already covers the need, and CDP-driving
+a GUI app tied to an interactive logon session was the more fragile of the two.
 
 **Known ceilings.** Intraday history is bounded by Upstox's 1-minute window.
 Drawing on pro.upstox.com's embedded TradingView widget was investigated and not
 built — `scripts/upstox_probe.py` is the read-only feasibility probe, never run;
-Path 1 already covers the need.
+the in-app chart already covers the need.

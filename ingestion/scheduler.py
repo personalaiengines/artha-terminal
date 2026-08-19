@@ -113,48 +113,50 @@ def _run_cache_cleanup():
     return CacheCleanup().run()
 
 
-def _run_fno_game_plan():
+def _run_fno_pnl_backfill():
+    """Daily F&O P&L reconciliation, every user, from Upstox trade history.
+
+    snapshot() only ever catches a day if someone had the app open while
+    Upstox's intraday positions endpoint still remembered the trade — miss
+    that window and the day is gone from the live source forever. This is the
+    safety net: after close, every user's book gets reconciled against the
+    broker's own trade record, so a session nobody was watching still shows
+    up instead of sitting at a stale/blank row until someone happens to click
+    Sync history.
     """
-    Daily F&O game plan for NIFTY / BANK NIFTY / SENSEX: compute levels, snapshot
-    each plan to JSON (history/audit), then draw the levels on TradingView.
-
-    The draw dry-runs safely if the tradingview-mcp CLI / TV Desktop isn't set up,
-    so this job never fails on a missing bridge.
-    """
-    import json as _json
-    from datetime import datetime as _datetime
-    from zoneinfo import ZoneInfo
-    from services.fno_service import build_game_plan, INDEXES
-    from services.tradingview_bridge import draw_levels
-
-    out_dir = config.db_path.parent / "fno_plans"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    date = _datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
-
+    from services import auth
+    from services.fno_pnl import backfill
     results = {}
-    for index in INDEXES:
+    with get_connection() as conn:
+        user_ids = [r[0] for r in conn.execute("SELECT id FROM users")]
+    for uid in user_ids:
+        # UpstoxClient resolves its token through config.upstox.access_token,
+        # a ProviderKey that reads the signed-in user's stored credential off
+        # this ContextVar — set only by the request middleware normally. This
+        # loop runs on the scheduler's own thread with no request behind it,
+        # so without setting it here every user's reconciliation would
+        # silently fall back to the same .env token instead of their own.
+        ctx_token = auth.current_user_id.set(uid)
         try:
-            plan = build_game_plan(index)
-            if not plan.get("ok"):
-                logger.warning(f"F&O {index}: {plan.get('error')}")
-                results[index] = {"ok": False, "error": plan.get("error")}
-                continue
-            snap = {k: v for k, v in plan.items() if k != "strikes"}
-            (out_dir / f"{index}_{date}.json").write_text(
-                _json.dumps(snap, indent=2, default=str), encoding="utf-8")
-
-            draw = draw_levels(index, plan.get("levels", []))
-            logger.info(
-                f"F&O {index}: bias {plan['bias']['label']} ({plan['bias']['score']}), "
-                f"{len(plan['levels'])} levels, draw mode={draw.get('mode')}"
-            )
-            results[index] = {"ok": True, "bias": plan["bias"]["label"],
-                              "levels": len(plan["levels"]), "draw": draw.get("mode")}
+            results[uid] = backfill(uid, years=1)
         except Exception as e:
-            logger.error(f"F&O {index} failed: {e}")
-            results[index] = {"ok": False, "error": str(e)}
+            results[uid] = {"ok": False, "error": str(e)}
+        finally:
+            auth.current_user_id.reset(ctx_token)
 
-    logger.info(f"F&O game-plan job complete: {results}")
+    # Same process as the API (this scheduler is started from its lifespan),
+    # so the in-memory response cache has to be evicted here too — otherwise
+    # a fresh reconciliation sits behind a stale cached /api/fno/pnl response
+    # for up to its TTL, same class of bug as the one this job exists to fix.
+    try:
+        from api.server import _cache
+        for uid in user_ids:
+            suffix = f":{uid}"
+            for key in [k for k in _cache if k.startswith("fno_pnl_") and k.endswith(suffix)]:
+                _cache.pop(key, None)
+    except Exception as e:
+        logger.debug(f"fno_pnl cache eviction skipped: {e}")
+
     return results
 
 
@@ -218,12 +220,13 @@ JOBS = [
      # After compute_metrics (22:00) — it reads the metrics it writes.
      "trigger": CronTrigger(hour=22, minute=30, timezone="Asia/Kolkata"),
      "fn": _run_compute_scores},
+    {"id": "fno_pnl_backfill", "name": "F&O P&L Reconciliation (all users)",
+     # After the session settles, before the nightly price ETL claims the box.
+     "trigger": CronTrigger(hour=20, minute=0, day_of_week="mon-fri", timezone="Asia/Kolkata"),
+     "fn": _run_fno_pnl_backfill},
     {"id": "cache_cleanup", "name": "Cache Cleanup",
      "trigger": CronTrigger(hour=3, minute=0, timezone="Asia/Kolkata"),
      "fn": _run_cache_cleanup},
-    {"id": "fno_game_plan", "name": "F&O Game Plan + TradingView draw",
-     "trigger": CronTrigger(hour=8, minute=45, day_of_week="mon-fri", timezone="Asia/Kolkata"),
-     "fn": _run_fno_game_plan},
     {"id": "market_news_curation", "name": "Market News Curation (HSTR-lite)",
      "trigger": IntervalTrigger(minutes=10, timezone="Asia/Kolkata"),
      "fn": _run_market_news_curation},

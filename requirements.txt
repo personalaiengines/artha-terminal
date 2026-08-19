@@ -5,10 +5,6 @@
 # Install with: pip install -r requirements.txt
 
 # --------------------------------------------
-# Web/UI Framework
-# --------------------------------------------
-
-# --------------------------------------------
 # Data Processing
 # --------------------------------------------
 pandas>=2.0.0
@@ -26,26 +22,25 @@ exchange_calendars>=4.5
 # --------------------------------------------
 # Broker Integration (Upstox)
 # --------------------------------------------
+# REST calls are a hand-rolled httpx client (services/upstox.py); the SDK is
+# used only for the market-data WebSocket streamer (services/upstox_stream.py
+# -> upstox_client.MarketDataStreamerV3).
 upstox-python-sdk>=2.28.0
 websockets>=12.0
 
 # --------------------------------------------
 # AI/LLM Layer
 # --------------------------------------------
+# Every provider is called over raw httpx (agent/llm_client.py) except
+# Anthropic direct, which lazy-imports the SDK only when ANTHROPIC_API_KEY is
+# set (AnthropicClient._sdk) — off by default, so it stays out of the hot path.
 httpx>=0.27.0
-openai>=1.30.0
 anthropic>=0.75.0
 
 # --------------------------------------------
-# Search APIs (Tavily Alternatives)
+# Search APIs
 # --------------------------------------------
-google-search-results>=2.4.0
-aiohttp>=3.9.0
-
-# --------------------------------------------
-# Database & Storage
-# --------------------------------------------
-sqlite-utils>=3.30.0
+# SerpAPI is called over raw httpx too (services/search.py) — no SDK.
 
 # --------------------------------------------
 # Job Scheduling
@@ -56,17 +51,11 @@ APScheduler>=3.10.0
 # Secrets & Configuration
 # --------------------------------------------
 python-dotenv>=1.0.0
-
-# --------------------------------------------
-# Caching Utilities
-# --------------------------------------------
-cachetools>=5.3.0
-
-# --------------------------------------------
-# Date/Time Utilities
-# --------------------------------------------
-python-dateutil>=2.8.0
-pytz>=2024.0
+# Fernet (authenticated encryption) for the API keys users store in the app.
+# These are live broker credentials; the stdlib has no authenticated cipher and
+# hand-rolling one here would be indefensible. Passwords, session tokens and
+# hashing all stay stdlib (hashlib.scrypt / secrets / hmac).
+cryptography>=42.0.0
 
 # --------------------------------------------
 # Development & Testing
@@ -78,8 +67,6 @@ pytest-cov>=4.0.0
 # --------------------------------------------
 # Utilities
 # --------------------------------------------
-tenacity>=8.2.0
-structlog>=24.1.0
 # JSON API for the Next.js web UI (api/server.py)
 starlette==1.3.1
 uvicorn==0.51.0

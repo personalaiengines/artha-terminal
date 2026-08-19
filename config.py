@@ -13,6 +13,44 @@ from typing import Optional
 load_dotenv()
 
 
+class ProviderKey:
+    """A credential field that is read LIVE on every access:
+    the signed-in user's stored key first, the `.env` value second, else None.
+
+    This exists because ~30 call sites already read `config.upstox.analytics_token`
+    or `config.ai.groq_api_key` directly. Making the *read* dynamic keeps every
+    one of them working unchanged while a key saved through the API takes effect
+    on the very next request — the alternative was rewriting each call site to
+    ask a resolver, which is a far larger diff for the same behaviour.
+
+    The `.env` value is the instance attribute set by `Config.__init__` (and by
+    tests/monkeypatch, which is why it stays writable). It is the fallback that
+    keeps ingestion and the scheduler — which run with no user — working.
+    """
+    __slots__ = ("env", "attr")
+
+    def __init__(self, env: str):
+        self.env = env
+
+    def __set_name__(self, owner, name):
+        self.attr = "_" + name
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return None  # dataclass reads this as the field's default
+        try:
+            from services.auth import user_key
+            stored = user_key(self.env)
+        except Exception:
+            # No auth module, no database yet, no ARTHA_SECRET_KEY: none of
+            # those should make a configured .env key unreadable.
+            stored = None
+        return stored or getattr(obj, self.attr, None)
+
+    def __set__(self, obj, value):
+        setattr(obj, self.attr, value)
+
+
 @dataclass
 class TierSpec:
     """One rung of a task-shape routing chain: which client + which model."""
@@ -47,26 +85,27 @@ class AIConfig:
 
     # Groq — fastest rung by an order of magnitude (0.5s vs 7-25s), 131K context,
     # tool-calling verified. Serves both task shapes, so it leads both chains.
-    groq_api_key: Optional[str] = None
+    groq_api_key: Optional[str] = ProviderKey("GROQ_API_KEY")
     groq_model: str = "openai/gpt-oss-120b"
 
     # Google Gemini free tier, via Google's OpenAI-compatible endpoint. A quota
     # pool independent of SambaNova/OpenRouter, which both 429 regularly.
     # Probed live: gemini-flash-latest 3.3s, gemini-flash-lite-latest 0.5s, both
     # returning proper tool_calls.
-    google_api_key: Optional[str] = None
+    google_api_key: Optional[str] = ProviderKey("GOOGLE_API_KEY")
     google_model: str = "gemini-flash-latest"
 
     # Direct Anthropic API — OPTIONAL, PAID. Off unless ANTHROPIC_API_KEY is
     # explicitly set; the free tiered chain below is the default path.
-    anthropic_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = ProviderKey("ANTHROPIC_API_KEY")
     anthropic_model: str = "claude-sonnet-5"
 
     # API Keys
-    openrouter_api_key: Optional[str] = None
-    nvidia_api_key: Optional[str] = None
-    sambanova_api_key: Optional[str] = None
-    github_models_token: Optional[str] = None  # GitHub PAT with `models: read`
+    openrouter_api_key: Optional[str] = ProviderKey("OPENROUTER_API_KEY")
+    nvidia_api_key: Optional[str] = ProviderKey("NVIDIA_API_KEY")
+    sambanova_api_key: Optional[str] = ProviderKey("SAMBANOVA_API_KEY")
+    # GitHub PAT with `models: read`
+    github_models_token: Optional[str] = ProviderKey("GITHUB_MODELS_TOKEN")
 
     sambanova_model: str = "Meta-Llama-3.3-70B-Instruct"
     github_models_model: str = "Llama-3.3-70B-Instruct"
@@ -145,12 +184,12 @@ class AIConfig:
 class SearchConfig:
     """Search API configuration."""
     provider: str = "serpapi"
-    serpapi_key: Optional[str] = None
-    serper_api_key: Optional[str] = None
-    bing_api_key: Optional[str] = None
-    jina_api_key: Optional[str] = None
+    serpapi_key: Optional[str] = ProviderKey("SERPAPI_KEY")
+    serper_api_key: Optional[str] = ProviderKey("SERPER_API_KEY")
+    bing_api_key: Optional[str] = ProviderKey("BING_API_KEY")
+    jina_api_key: Optional[str] = ProviderKey("JINA_API_KEY")
     searxng_url: str = "http://localhost:8080"
-    finnhub_api_key: Optional[str] = None
+    finnhub_api_key: Optional[str] = ProviderKey("FINNHUB_API_KEY")
 
     @property
     def has_serpapi(self) -> bool:
@@ -172,10 +211,10 @@ class SearchConfig:
 @dataclass
 class UpstoxConfig:
     """Upstox broker API configuration."""
-    analytics_token: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    access_token: Optional[str] = None
+    analytics_token: Optional[str] = ProviderKey("UPSTOX_ANALYTICS_TOKEN")
+    client_id: Optional[str] = ProviderKey("UPSTOX_CLIENT_ID")
+    client_secret: Optional[str] = ProviderKey("UPSTOX_CLIENT_SECRET")
+    access_token: Optional[str] = ProviderKey("UPSTOX_ACCESS_TOKEN")
     redirect_uri: str = "http://localhost:3000/upstox/callback"
 
     def authorize_url(self) -> str:

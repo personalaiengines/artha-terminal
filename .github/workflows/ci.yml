@@ -5,6 +5,11 @@ on: [push, pull_request]
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # services/auth.py refuses to import without this, which is the point —
+      # the app must never invent its credential-encryption key. CI's copy is
+      # throwaway: it encrypts nothing that outlives the job.
+      ARTHA_SECRET_KEY: ci-only-not-a-real-secret-0000000000
     steps:
       - uses: actions/checkout@v4
 

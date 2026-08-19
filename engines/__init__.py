@@ -1,11 +1,10 @@
 """
 ARTHA Terminal - Engines Module
-Deterministic analysis engines (Red-Flag, Scorecard, Verification).
+Deterministic analysis engines (Red-Flag, Scorecard).
 """
 
 from .red_flags import RedFlagEngine, Severity, RedFlag
 from .scorecard import ScorecardEngine, Scorecard, SubScore
-from .verification import VerificationMembrane, VerifiedField, VerifiedStatus
 
 __all__ = [
     "RedFlagEngine",
@@ -14,7 +13,4 @@ __all__ = [
     "ScorecardEngine",
     "Scorecard",
     "SubScore",
-    "VerificationMembrane",
-    "VerifiedField",
-    "VerifiedStatus",
 ]

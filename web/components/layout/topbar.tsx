@@ -5,6 +5,7 @@ import { useUI } from "./ui-store";
 import { Kbd, LiveDot, Segmented } from "@/components/ui/primitives";
 import { IconButton } from "@/components/ui/button";
 import { IndexTicker } from "@/components/widgets/india-indices";
+import { AccountMenu } from "./account-menu";
 
 export function Topbar() {
   const { setCmdk, changeMode, setChangeMode } = useUI();
@@ -39,8 +40,7 @@ export function Topbar() {
           <Bell size={17} />
         </Link>
 
-        <Link href="/settings" aria-label="Account"
-          className="h-8 w-8 rounded-full bg-gradient-to-br from-accent to-ai ring-focus transition-transform hover:scale-105" />
+        <AccountMenu />
       </div>
     </header>
   );

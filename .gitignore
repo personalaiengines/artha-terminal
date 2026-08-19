@@ -107,8 +107,4 @@ web/.checkout/
 .claude/
 .agents/
 .mcp.json
-# runtime ETL output — regenerated daily by ingestion/scheduler.py
-db/fno_plans/
-db/tv_draw_plans/
-
 .claude/runs/

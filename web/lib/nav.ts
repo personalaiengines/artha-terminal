@@ -7,7 +7,7 @@ import {
 export type NavItem = { label: string; href: string; icon: LucideIcon; group: string; badge?: string };
 
 export const NAV: NavItem[] = [
-  { label: "Dashboard", href: "/", icon: LayoutDashboard, group: "Workspace" },
+  { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard, group: "Workspace" },
   { label: "Markets", href: "/markets", icon: LineChart, group: "Workspace" },
   { label: "Portfolio", href: "/portfolio", icon: Wallet, group: "Workspace" },
   { label: "Watchlists", href: "/watchlists", icon: Star, group: "Workspace" },

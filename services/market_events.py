@@ -121,6 +121,25 @@ _FF_IMPACT = {"high": "high", "medium": "medium", "low": "low", "holiday": "low"
 _IST = ZoneInfo("Asia/Kolkata")
 
 
+def _recurring(days_ahead: int) -> list[dict]:
+    start, end = _today_ist(), _today_ist() + timedelta(days=days_ahead)
+    events = []
+    for delta in (0, 1):
+        mo = start.month + delta
+        y, mo = start.year + (mo - 1) // 12, (mo - 1) % 12 + 1
+        expiry = _last_weekday_of_month(y, mo, 3)  # last Thursday
+        if start <= expiry <= end:
+            events.append(_evt(expiry, "schedule", "NSE monthly F&O expiry",
+                               "Derivatives settlement — elevated volatility",
+                               _NSE_EXPIRY_URL, "india"))
+        nfp = _nth_weekday_of_month(y, mo, 4, 1)  # first Friday
+        if start <= nfp <= end:
+            events.append(_evt(nfp, "schedule", "US Non-Farm Payrolls",
+                               "Key US jobs data — global risk driver",
+                               _BLS_NFP_URL, "international"))
+    return events
+
+
 def _ff_rows(raw: list, start: date, end: date) -> list[dict]:
     """Map one Forex Factory feed payload into calendar rows. Pure — the test
     feeds it a fixture, `_econ_calendar` feeds it the live JSON."""

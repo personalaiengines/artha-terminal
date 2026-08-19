@@ -1,4 +1,8 @@
-"""F&O P&L tracker: snapshot upsert, per-contract grain, curve, window stats."""
+"""F&O P&L tracker: snapshot upsert, per-contract grain, curve, window stats.
+
+Every row belongs to a user (`ME` below). `OTHER` writes the same dates and the
+same contracts on purpose — the tracker must not see a single one of them.
+"""
 
 import sqlite3
 from contextlib import contextmanager
@@ -7,18 +11,21 @@ import pytest
 
 import services.fno_pnl as P
 
+ME, OTHER = 1, 2
+
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     conn = sqlite3.connect(tmp_path / "t.db")
     conn.row_factory = sqlite3.Row
     conn.execute("""CREATE TABLE fno_pnl_daily (
-        date TEXT PRIMARY KEY, realized REAL, unrealized REAL, net REAL,
+        user_id INTEGER, date TEXT, realized REAL, unrealized REAL, net REAL,
         open_count INTEGER, closed_count INTEGER, updated_at TEXT,
-        source TEXT DEFAULT 'live')""")
+        source TEXT DEFAULT 'live', PRIMARY KEY (user_id, date))""")
     conn.execute("""CREATE TABLE fno_pnl_contract_daily (
-        date TEXT, symbol TEXT, realized REAL, unrealized REAL, net REAL,
-        qty INTEGER, updated_at TEXT, PRIMARY KEY (date, symbol))""")
+        user_id INTEGER, date TEXT, symbol TEXT, realized REAL, unrealized REAL,
+        net REAL, qty INTEGER, updated_at TEXT,
+        PRIMARY KEY (user_id, date, symbol))""")
 
     @contextmanager
     def _conn(*a, **k):
@@ -28,14 +35,14 @@ def db(tmp_path, monkeypatch):
     return conn
 
 
-def _day(db, date, net, source="live"):
-    db.execute("INSERT INTO fno_pnl_daily VALUES (?,0,?,?,0,0,'x',?)",
-               (date, net, net, source))
+def _day(db, date, net, source="live", user=ME):
+    db.execute("INSERT INTO fno_pnl_daily VALUES (?,?,0,?,?,0,0,'x',?)",
+               (user, date, net, net, source))
 
 
-def _contract(db, date, symbol, net):
-    db.execute("INSERT INTO fno_pnl_contract_daily VALUES (?,?,0,?,?,0,'x')",
-               (date, symbol, net, net))
+def _contract(db, date, symbol, net, user=ME):
+    db.execute("INSERT INTO fno_pnl_contract_daily VALUES (?,?,?,0,?,?,0,'x')",
+               (user, date, symbol, net, net))
 
 
 def test_session_date_does_not_invent_a_session_after_midnight():
@@ -54,8 +61,8 @@ def test_session_date_does_not_invent_a_session_after_midnight():
 
 def test_snapshot_overwrites_same_day(db, monkeypatch):
     monkeypatch.setattr(P, "session_date", lambda: "2026-08-04")
-    P.snapshot([{"symbol": "NIFTY26AUG24400CE", "realized": 100.0, "unrealized": 50.0, "qty": 75}])
-    P.snapshot([{"symbol": "NIFTY26AUG24400CE", "realized": 400.0, "unrealized": -25.0, "qty": 0}])
+    P.snapshot([{"symbol": "NIFTY26AUG24400CE", "realized": 100.0, "unrealized": 50.0, "qty": 75}], ME)
+    P.snapshot([{"symbol": "NIFTY26AUG24400CE", "realized": 400.0, "unrealized": -25.0, "qty": 0}], ME)
     rows = list(db.execute("SELECT * FROM fno_pnl_daily"))
     assert len(rows) == 1
     assert (rows[0]["realized"], rows[0]["net"], rows[0]["closed_count"]) == (400.0, 375.0, 1)
@@ -63,18 +70,51 @@ def test_snapshot_overwrites_same_day(db, monkeypatch):
     assert len(list(db.execute("SELECT * FROM fno_pnl_contract_daily"))) == 1
 
 
+def test_two_users_snapshotting_the_same_session_do_not_overwrite_each_other(db, monkeypatch):
+    """The day used to be the whole primary key. With two accounts that made
+    every snapshot an UPSERT over somebody else's session — the second user to
+    open the app would have silently replaced the first one's P&L."""
+    monkeypatch.setattr(P, "session_date", lambda: "2026-08-04")
+    P.snapshot([{"symbol": "NIFTY26AUG24400CE", "realized": 100.0, "unrealized": 0.0, "qty": 75}], ME)
+    P.snapshot([{"symbol": "NIFTY26AUG24400CE", "realized": 999.0, "unrealized": 0.0, "qty": 75}], OTHER)
+
+    assert P.history(ME)["stats"]["total"] == 100.0
+    assert P.history(OTHER)["stats"]["total"] == 999.0
+    assert len(list(db.execute("SELECT * FROM fno_pnl_daily"))) == 2
+    # ...and the same contract on the same day is two rows, not one overwritten.
+    assert len(list(db.execute("SELECT * FROM fno_pnl_contract_daily"))) == 2
+
+
 def test_snapshot_returns_totals_even_when_the_write_fails(monkeypatch):
     """It rides along on the live positions read — a tracker write must not be
     able to take the user's book down, and the API still needs the totals."""
     monkeypatch.setattr(P, "get_connection", lambda *a, **k: 1 / 0)
-    assert P.snapshot([{"symbol": "X", "realized": 10.0, "unrealized": 5.0, "qty": 1}]) == {
+    assert P.snapshot([{"symbol": "X", "realized": 10.0, "unrealized": 5.0, "qty": 1}], ME) == {
         "realized": 10.0, "unrealized": 5.0, "net": 15.0}
+
+
+def test_history_never_returns_another_users_sessions(db):
+    """Days, contracts, months and stats are four separate queries. All four
+    have to filter, or one of them leaks the other book."""
+    _day(db, "2026-08-03", 500)
+    _contract(db, "2026-08-03", "NIFTY26AUG24400CE", 500)
+    _day(db, "2026-06-01", 4242, user=OTHER)
+    _contract(db, "2026-06-01", "SECRET26JUN100PE", 4242, user=OTHER)
+
+    h = P.history(ME)
+    assert [r["date"] for r in h["days"]] == ["2026-08-03"]
+    assert [c["symbol"] for c in h["contracts"]] == ["NIFTY26AUG24400CE"]
+    assert h["months"] == ["2026-08"]          # not 2026-06
+    assert h["stats"]["total"] == 500
+
+    # A user with no record of their own sees nothing, not the other book.
+    assert P.history(3)["days"] == [] and P.history(3)["months"] == []
 
 
 def test_history_curve_and_stats(db):
     for d, n in [("2026-08-01", 500), ("2026-08-02", -200), ("2026-08-03", -100)]:
         _day(db, d, n)
-    h = P.history()
+    h = P.history(ME)
     assert [r["date"] for r in h["days"]] == ["2026-08-01", "2026-08-02", "2026-08-03"]
     assert [r["cumulative"] for r in h["days"]] == [500, 300, 200]
     s = h["stats"]
@@ -90,7 +130,7 @@ def test_contracts_aggregate_over_the_window_and_carry_filter_fields(db):
     _contract(db, "2026-08-01", "NIFTY26AUG24400CE", 300)
     _contract(db, "2026-08-02", "NIFTY26AUG24400CE", 200)  # same contract, next day
     _contract(db, "2026-08-02", "BANKNIFTY26AUG52000PE", -900)
-    c = P.history()["contracts"]
+    c = P.history(ME)["contracts"]
     assert [x["symbol"] for x in c] == ["BANKNIFTY26AUG52000PE", "NIFTY26AUG24400CE"]
     assert c[1]["net"] == 500 and c[1]["sessions"] == 2
     assert (c[0]["underlying"], c[0]["right"]) == ("BANKNIFTY", "PE")
@@ -101,7 +141,7 @@ def test_contracts_are_scoped_to_the_requested_window(db):
     _day(db, "2026-08-03", 0)  # window starts here
     _contract(db, "2026-07-01", "OLD26JUL100CE", 999)
     _contract(db, "2026-08-03", "NEW26AUG100CE", 10)
-    assert [c["symbol"] for c in P.history("2026-08-03")["contracts"]] == ["NEW26AUG100CE"]
+    assert [c["symbol"] for c in P.history(ME, "2026-08-03")["contracts"]] == ["NEW26AUG100CE"]
 
 
 def test_history_slices_on_the_requested_month_and_lists_available_months(db):
@@ -109,7 +149,7 @@ def test_history_slices_on_the_requested_month_and_lists_available_months(db):
     is built from — it must offer only months the record actually has."""
     for d in ("2026-06-30", "2026-07-01", "2026-07-31", "2026-08-03"):
         _day(db, d, 100)
-    h = P.history("2026-07-01", "2026-07-31")
+    h = P.history(ME, "2026-07-01", "2026-07-31")
     assert [r["date"] for r in h["days"]] == ["2026-07-01", "2026-07-31"]
     assert h["stats"]["sessions"] == 2 and h["stats"]["total"] == 200
     # the month list spans the whole record, not the slice
@@ -119,13 +159,13 @@ def test_history_slices_on_the_requested_month_and_lists_available_months(db):
 def test_flat_day_settles_nothing(db):
     _day(db, "2026-08-01", 300)
     _day(db, "2026-08-02", 0)
-    s = P.history()["stats"]
+    s = P.history(ME)["stats"]
     assert s["win_rate"] == 100.0  # the flat day is not a loss
     assert s["streak"] == 0
 
 
 def test_empty_record_reports_no_numbers(db):
-    h = P.history()
+    h = P.history(ME)
     assert h["contracts"] == []
     assert h["stats"]["sessions"] == 0 and h["stats"]["best"] is None
     assert h["stats"]["win_rate"] is None

@@ -150,7 +150,9 @@ def _positions_returning(monkeypatch, payload):
 
     monkeypatch.setattr(up, "UpstoxClient", _C)
     from api.server import _positions
-    return _positions()
+    # The book is snapshotted into that user's fno_pnl_daily, so the read needs
+    # an owner. 1 = whichever account the request came from.
+    return _positions(1)
 
 
 def test_positions_maps_fno_rows_and_drops_everything_else(monkeypatch):
@@ -224,8 +226,13 @@ def test_expired_token_yields_no_items_and_a_message(monkeypatch):
 
 
 def test_positions_route_is_get_only():
-    from api.server import app
-    client = TestClient(app)   # not a context manager: no lifespan, no ingestion
+    # Built from the route table rather than `api.server.app`: the bearer gate
+    # in front of the app answers 401 before routing, which would mask the 405
+    # this test exists to assert. That auth comes first is covered in
+    # tests/test_auth.py; the method restriction is a routing property.
+    from starlette.applications import Starlette
+    from api.server import routes
+    client = TestClient(Starlette(routes=routes))   # no lifespan, no ingestion
     for method in ("post", "put", "delete", "patch"):
         assert getattr(client, method)("/api/positions").status_code == 405
 
